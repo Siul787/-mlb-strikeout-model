@@ -317,9 +317,8 @@ try:
             st.caption(
             "K% is calculated as strikeouts ÷ batters faced × 100. "
             "All other statistics are loaded from the MLB Stats API."
-        )
-
-       except MLBApiError as exc:
+        ) 
+except MLBApiError as exc:
             st.warning(f"Pitcher season statistics could not be loaded: {exc}")
 
             st.info(
