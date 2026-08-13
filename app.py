@@ -71,6 +71,19 @@ def fetch_pitcher_season_stats(player_id: int, season: int) -> dict:
         k_pct = (strikeouts / batters_faced) * 100
 
     stat["calculatedKPercentage"] = k_pct
+    walks = stat.get("baseOnBalls")
+
+bb_pct = None
+k_minus_bb_pct = None
+
+if isinstance(walks, (int, float)) and isinstance(batters_faced, (int, float)) and batters_faced > 0:
+    bb_pct = (walks / batters_faced) * 100
+
+if k_pct is not None and bb_pct is not None:
+    k_minus_bb_pct = k_pct - bb_pct
+
+stat["calculatedBBPercentage"] = bb_pct
+stat["calculatedKMinusBBPercentage"] = k_minus_bb_pct
 
     return stat
 
@@ -269,6 +282,8 @@ try:
         k9 = pitcher_stats.get("strikeoutsPer9Inn", "N/A")
         bb9 = pitcher_stats.get("walksPer9Inn", "N/A")
         k_pct = pitcher_stats.get("calculatedKPercentage")
+        bb_pct = pitcher_stats.get("calculatedBBPercentage")
+        k_minus_bb_pct = pitcher_stats.get("calculatedKMinusBBPercentage")
 
         col1, col2, col3 = st.columns(3)
 
@@ -290,17 +305,26 @@ try:
             st.metric(
                 "K% (calculated)",
                 f"{k_pct:.1f}%" if isinstance(k_pct, (int, float)) else "N/A",
-            )
+ )
+      
+        st.metric(
+       "BB% (calculated)",
+        f"{bb_pct:.1f}%" if isinstance(bb_pct, (int, float)) else "N/A",
+)
 
-        st.caption(
+       st.metric(
+       "K-BB% (calculated)",
+       f"{k_minus_bb_pct:.1f}%" if isinstance(k_minus_bb_pct, (int, float)) else "N/A",
+)
+       st.caption(
             "K% is calculated as strikeouts ÷ batters faced × 100. "
             "All other statistics are loaded from the MLB Stats API."
         )
 
-except MLBApiError as exc:
+    except MLBApiError as exc:
     st.warning(f"Pitcher season statistics could not be loaded: {exc}")
 
-st.info(
+    st.info(
     "The strikeout prediction model is disabled for now. "
     "No prediction is being calculated."
 )
