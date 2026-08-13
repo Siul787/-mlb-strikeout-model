@@ -305,8 +305,7 @@ try:
                 "K% (calculated)",
                 f"{k_pct:.1f}%" if isinstance(k_pct, (int, float)) else "N/A",
  )
-      
-st.metric(
+      st.metric(
        "BB% (calculated)",
         f"{bb_pct:.1f}%" if isinstance(bb_pct, (int, float)) else "N/A",
 )
