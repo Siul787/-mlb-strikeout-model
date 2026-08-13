@@ -40,6 +40,40 @@ def fetch_pitcher_profile(player_id: int) -> dict:
         raise MLBApiError("The MLB Stats API did not return this pitcher's profile.")
     return people[0]
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_pitcher_season_stats(player_id: int, season: int) -> dict:
+    payload = get_json(
+        f"{MLB_PEOPLE_URL}/{player_id}/stats",
+        params={
+            "stats": "season",
+            "group": "pitching",
+            "season": season,
+        },
+    )
+
+    stats_groups = payload.get("stats", [])
+    if not stats_groups:
+        return {}
+
+    splits = stats_groups[0].get("splits", [])
+    if not splits:
+        return {}
+
+    stat = splits[0].get("stat", {})
+    if not isinstance(stat, dict):
+        return {}
+
+    strikeouts = stat.get("strikeOuts")
+    batters_faced = stat.get("battersFaced")
+
+    k_pct = None
+    if isinstance(strikeouts, (int, float)) and isinstance(batters_faced, (int, float)) and batters_faced > 0:
+        k_pct = (strikeouts / batters_faced) * 100
+
+    stat["calculatedKPercentage"] = k_pct
+
+    return stat
+
 
 def format_game_time(game_date: str | None) -> str:
     if not game_date:
@@ -122,6 +156,7 @@ def fetch_pitchers_for_date(selected_date: str) -> dict:
                 pitcher_options.append(
                     {
                         "selection_id": f"{game.get('gamePk')}-{side}-{pitcher_id}",
+        "pitcher_id": int(pitcher_id),
                         "pitcher_name": pitcher_name,
                         "team": team.get("name", "Unknown team"),
                         "opponent": (
@@ -211,6 +246,59 @@ st.write(f"**Team:** {selected_pitcher['team']}")
 st.write(f"**Opponent:** {selected_pitcher['opponent']}")
 st.write(f"**Throwing hand:** {selected_pitcher['throwing_hand']}")
 st.write(f"**Game time:** {selected_pitcher['game_time']}")
+st.subheader("Pitcher Data")
+
+try:
+    with st.spinner("Loading pitcher season statistics..."):
+        pitcher_stats = fetch_pitcher_season_stats(
+            selected_pitcher["pitcher_id"],
+            game_date.year,
+        )
+
+    if not pitcher_stats:
+        st.info("No season pitching statistics are available for this pitcher.")
+    else:
+        games_started = pitcher_stats.get("gamesStarted", "N/A")
+        innings_pitched = pitcher_stats.get("inningsPitched", "N/A")
+        batters_faced = pitcher_stats.get("battersFaced", "N/A")
+        strikeouts = pitcher_stats.get("strikeOuts", "N/A")
+        walks = pitcher_stats.get("baseOnBalls", "N/A")
+        home_runs = pitcher_stats.get("homeRuns", "N/A")
+        era = pitcher_stats.get("era", "N/A")
+        whip = pitcher_stats.get("whip", "N/A")
+        k9 = pitcher_stats.get("strikeoutsPer9Inn", "N/A")
+        bb9 = pitcher_stats.get("walksPer9Inn", "N/A")
+        k_pct = pitcher_stats.get("calculatedKPercentage")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric("GS", games_started)
+            st.metric("BF", batters_faced)
+            st.metric("BB", walks)
+            st.metric("WHIP", whip)
+
+        with col2:
+            st.metric("IP", innings_pitched)
+            st.metric("K", strikeouts)
+            st.metric("HR", home_runs)
+            st.metric("K/9", k9)
+
+        with col3:
+            st.metric("ERA", era)
+            st.metric("BB/9", bb9)
+            st.metric(
+                "K% (calculated)",
+                f"{k_pct:.1f}%" if isinstance(k_pct, (int, float)) else "N/A",
+            )
+
+        st.caption(
+            "K% is calculated as strikeouts ÷ batters faced × 100. "
+            "All other statistics are loaded from the MLB Stats API."
+        )
+
+except MLBApiError as exc:
+    st.warning(f"Pitcher season statistics could not be loaded: {exc}")
 
 st.info(
     "The strikeout prediction model is disabled for now. "
