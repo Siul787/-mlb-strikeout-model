@@ -84,8 +84,7 @@ if k_pct is not None and bb_pct is not None:
 
 stat["calculatedBBPercentage"] = bb_pct
 stat["calculatedKMinusBBPercentage"] = k_minus_bb_pct
-
-    return stat
+return stat
 
 
 def format_game_time(game_date: str | None) -> str:
