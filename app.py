@@ -77,10 +77,10 @@ def fetch_pitcher_season_stats(player_id: int, season: int) -> dict:
     k_minus_bb_pct = None
 
     if isinstance(walks, (int, float)) and isinstance(batters_faced, (int, float)) and batters_faced > 0:
-    bb_pct = (walks / batters_faced) * 100
+        bb_pct = (walks / batters_faced) * 100
 
     if k_pct is not None and bb_pct is not None:
-    k_minus_bb_pct = k_pct - bb_pct
+        k_minus_bb_pct = k_pct - bb_pct
 
 stat["calculatedBBPercentage"] = bb_pct
 stat["calculatedKMinusBBPercentage"] = k_minus_bb_pct
