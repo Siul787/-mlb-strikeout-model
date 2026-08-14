@@ -782,23 +782,167 @@ def grade_bet(ev, edge_pp, completeness):
     return "PASS"
 
 
+
+# =========================================================
+# ACTION NETWORK
+# =========================================================
+
+ACTION_PITCHING_PROPS_URL = "https://www.actionnetwork.com/mlb/props/pitching"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def action_network_public_props():
+    """
+    Best-effort reader for Action Network's public MLB pitching-props page.
+    The site may render odds client-side or change markup, so failure is expected
+    and is handled explicitly. Authenticated PRO data is not scraped.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
+        )
+    }
+    try:
+        r = requests.get(ACTION_PITCHING_PROPS_URL, headers=headers, timeout=TIMEOUT)
+        r.raise_for_status()
+        tables = pd.read_html(StringIO(r.text))
+        cleaned = []
+        for table in tables:
+            if isinstance(table.columns, pd.MultiIndex):
+                table.columns = [
+                    " ".join(str(x).strip() for x in col if str(x).strip() and str(x) != "nan").strip()
+                    for col in table.columns
+                ]
+            else:
+                table.columns = [str(c).strip() for c in table.columns]
+            if not table.empty:
+                cleaned.append(table)
+        return cleaned, "OK"
+    except Exception as exc:
+        return [], f"UNAVAILABLE: {str(exc)[:90]}"
+
+
+def action_pitcher_rows(tables, pitcher_name: str):
+    target = normalize_name(pitcher_name)
+    hits = []
+    for idx, table in enumerate(tables):
+        try:
+            mask = table.astype(str).apply(
+                lambda col: col.map(normalize_name).map(lambda x: target in x)
+            ).any(axis=1)
+            matched = table[mask]
+            if not matched.empty:
+                for _, row in matched.iterrows():
+                    data = {"Table": idx + 1}
+                    data.update({str(k): v for k, v in row.to_dict().items()})
+                    hits.append(data)
+        except Exception:
+            continue
+    return pd.DataFrame(hits)
+
+
+def action_signal_score(action_projection, model_projection, bets_pct, money_pct, sharp_flag, line_move):
+    """
+    Action Network is a validation layer, not a hidden replacement for the model.
+    Returns a small informational score from -3 to +3.
+    """
+    score = 0.0
+
+    ap = safe_num(action_projection)
+    mp = safe_num(model_projection)
+    if ap is not None and mp is not None:
+        diff = ap - mp
+        score += clamp(diff / 0.75, -1.0, 1.0)
+
+    bp = safe_num(bets_pct)
+    mpct = safe_num(money_pct)
+    if bp is not None and mpct is not None:
+        # Money > bets can indicate larger average wager size on the selected side.
+        score += clamp((mpct - bp) / 20.0, -1.0, 1.0)
+
+    if sharp_flag:
+        score += 0.75
+
+    lm = safe_num(line_move)
+    if lm is not None:
+        score += clamp(lm / 0.5, -0.75, 0.75)
+
+    return clamp(score, -3.0, 3.0)
+
+
 # =========================================================
 # APP
 # =========================================================
 
 st.markdown(
     """
-    <div class="hero">
-      <h1 style="margin:0">\u26be MLB Starting Pitcher K Model</h1>
-      <div class="muted">V1.2 \u00b7 MLB + Baseball Savant + FanGraphs + Baseball-Reference \u00b7 DraftKings + FanDuel</div>
+    <style>
+    .block-container {max-width: 1120px; padding-top: .75rem; padding-bottom: 4rem;}
+    h1,h2,h3 {letter-spacing:-.025em;}
+    .topbar {
+        padding: 18px 20px;
+        border: 1px solid rgba(128,128,128,.18);
+        border-radius: 22px;
+        background: linear-gradient(135deg, rgba(35,90,240,.16), rgba(120,80,220,.08));
+        margin-bottom: 14px;
+    }
+    .pitcher-card {
+        padding: 18px 20px;
+        border-radius: 22px;
+        border: 1px solid rgba(128,128,128,.20);
+        background: rgba(128,128,128,.045);
+        margin: 8px 0 14px 0;
+    }
+    .pill {
+        display:inline-block;
+        padding:5px 9px;
+        border-radius:999px;
+        background:rgba(128,128,128,.12);
+        margin-right:5px;
+        font-size:.78rem;
+    }
+    .best-card {
+        border-radius:22px;
+        padding:20px;
+        background: linear-gradient(145deg, rgba(30,115,255,.20), rgba(30,115,255,.06));
+        border: 1px solid rgba(30,115,255,.40);
+        margin: 12px 0;
+    }
+    .source-card {
+        border:1px solid rgba(128,128,128,.15);
+        border-radius:16px;
+        padding:12px 14px;
+        margin-bottom:8px;
+    }
+    div[data-testid="stMetric"] {
+        border: 1px solid rgba(128,128,128,.16);
+        border-radius: 16px;
+        padding: 12px;
+        background: rgba(128,128,128,.035);
+    }
+    div[data-testid="stTabs"] button {font-weight:650;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="topbar">
+      <div style="font-size:.82rem;opacity:.7">MLB STARTING PITCHER STRIKEOUT MODEL</div>
+      <div style="font-size:2rem;font-weight:800;line-height:1.1">K Edge Dashboard</div>
+      <div style="font-size:.86rem;opacity:.72;margin-top:6px">
+        V1.3 \u00b7 MLB \u00b7 Savant \u00b7 Baseball-Reference \u00b7 FanGraphs fallback \u00b7 Action Network validation
+      </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-top1, top2 = st.columns([1, 2])
-with top1:
-    game_date = st.date_input("Fecha", value=date.today(), min_value=date(2008,1,1))
+pick1, pick2 = st.columns([1, 2.3])
+with pick1:
+    game_date = st.date_input("Fecha", value=date.today(), min_value=date(2008, 1, 1))
 
 try:
     options = pitchers_for_date(game_date.isoformat())
@@ -811,26 +955,34 @@ if not options:
     st.stop()
 
 by_id = {p["selection_id"]: p for p in options}
-with top2:
+with pick2:
     selected_id = st.selectbox(
         "Abridor",
         list(by_id),
-        format_func=lambda x: f"{by_id[x]['pitcher_name']} \u00b7 {by_id[x]['team']} vs {by_id[x]['opponent']}",
+        format_func=lambda x: (
+            f"{by_id[x]['pitcher_name']} \u00b7 "
+            f"{by_id[x]['team']} vs {by_id[x]['opponent']}"
+        ),
     )
 
 p = by_id[selected_id]
 
 st.markdown(
     f"""
-    <div class="hero">
-      <h2 style="margin:0">{p['pitcher_name']} <span style="opacity:.55">vs {p['opponent']}</span></h2>
-      <div class="muted">{p['team']} \u00b7 {p['throwing_hand']} \u00b7 {p['venue']} \u00b7 {p['game_time']} \u00b7 {p['status']}</div>
+    <div class="pitcher-card">
+      <div style="font-size:1.65rem;font-weight:800">{p['pitcher_name']}</div>
+      <div style="font-size:1.05rem;opacity:.65;margin-bottom:8px">vs {p['opponent']}</div>
+      <span class="pill">{p['team']}</span>
+      <span class="pill">{p['throwing_hand']}</span>
+      <span class="pill">{p['venue']}</span>
+      <span class="pill">{p['game_time']}</span>
+      <span class="pill">{p['status']}</span>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-with st.spinner("Cargando fuentes..."):
+with st.spinner("Sincronizando fuentes..."):
     try:
         mlb = pitcher_season_stats(p["pitcher_id"], game_date.year)
     except Exception:
@@ -857,7 +1009,11 @@ with st.spinner("Cargando fuentes..."):
     except Exception:
         feed = {}
 
-    sc_df = statcast_data(p["pitcher_id"], f"{game_date.year}-03-01", game_date.isoformat())
+    sc_df = statcast_data(
+        p["pitcher_id"],
+        f"{game_date.year}-03-01",
+        game_date.isoformat(),
+    )
     sm = statcast_metrics(sc_df)
 
     fg_df, fg_status = fangraphs_pitchers(game_date.year)
@@ -873,182 +1029,372 @@ with st.spinner("Cargando fuentes..."):
     lineup = enrich_lineup(lineup_raw, game_date.year, p["throwing_hand"]) if lineup_raw else []
     recent = recent_summary(log)
 
-proj = build_projection(mlb, fg, sm, team_general, team_split, lineup, recent, park_so, context)
+proj = build_projection(
+    mlb, fg, sm, team_general, team_split, lineup, recent, park_so, context
+)
 
-# MAIN SUMMARY
-s1, s2, s3, s4, s5 = st.columns(5)
-s1.metric("Proyecci\u00f3n", fmt(proj["central"], 2, " K"))
-s2.metric("Rango", f"{proj['low']:.1f}\u2013{proj['high']:.1f}")
-s3.metric("Projected BF", fmt(proj["bf"], 1))
-s4.metric("Projected K%", fmt(proj["k_pct"], 1, "%"))
-s5.metric("SO Park Factor", fmt(park_so, 0))
+# ------------------------------------------------------------------
+# MARKET INPUTS are shared across tabs
+# ------------------------------------------------------------------
 
-# MODULES
-with st.expander("M1 \u00b7 Capacidad real de K \u2014 20%", expanded=True):
-    a,b,c,d = st.columns(4)
-    a.metric("K%", fmt(mlb.get("calc_k_pct"),1,"%"))
-    a.metric("K-BB%", fmt(mlb.get("calc_k_minus_bb"),1,"%"))
-    b.metric("K/9", mlb.get("strikeoutsPer9Inn","N/A"))
-    b.metric("WHIP", mlb.get("whip","N/A"))
-    c.metric("Whiff%", fmt(sm.get("whiff_pct"),1,"%"))
-    c.metric("CSW%", fmt(sm.get("csw_pct"),1,"%"))
-    d.metric("Fastball Velo", fmt(sm.get("fastball_velo"),1," mph"))
-    fg_k_display = (safe_num(fg.get("K%"))*100 if safe_num(fg.get("K%")) is not None and safe_num(fg.get("K%")) <= 1 else fg.get("K%"))
-    d.metric("FanGraphs K%", fmt(fg_k_display, 1, "%"))
-    if fg_status != "OK":
-        d.caption("FanGraphs source: " + fg_status)
+tab_summary, tab_modules, tab_market, tab_sources = st.tabs(
+    ["Resumen", "M\u00f3dulos", "Mercado", "Fuentes"]
+)
 
-with st.expander("M2 \u00b7 Volumen / Leash \u2014 20%"):
-    a,b,c,d = st.columns(4)
-    a.metric("GS", mlb.get("gamesStarted","N/A"))
-    a.metric("IP/start", fmt(mlb.get("calc_ip_start"),2))
-    b.metric("BF/start", fmt(mlb.get("calc_bf_start"),1))
-    b.metric("Avg BF L5", fmt(recent.get("avg_bf"),1))
-    c.metric("Avg Pitches L5", fmt(recent.get("avg_pitches"),1))
-    c.metric("Max Pitches L5", fmt(recent.get("max_pitches"),0))
-    d.metric("Avg K L5", fmt(recent.get("avg_k"),1))
-    d.metric("Avg IP L5", fmt(recent.get("avg_ip"),2))
+with tab_summary:
+    st.subheader("Proyecci\u00f3n")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("K proyectados", fmt(proj["central"], 2))
+    r2.metric("Rango probable", f"{proj['low']:.1f} \u2013 {proj['high']:.1f}")
+    r3.metric("Batters Faced", fmt(proj["bf"], 1))
+    r4.metric("K% proyectado", fmt(proj["k_pct"], 1, "%"))
 
-with st.expander("M3 \u00b7 Splits \u2014 10%"):
-    a,b,c,d = st.columns(4)
-    a.metric("K% vs LHB", fmt(sm.get("vs_l"),1,"%"))
-    b.metric("K% vs RHB", fmt(sm.get("vs_r"),1,"%"))
-    c.metric("K% Home", fmt(sm.get("home"),1,"%"))
-    d.metric("K% Away", fmt(sm.get("away"),1,"%"))
+    st.subheader("Snapshot")
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("K%", fmt(mlb.get("calc_k_pct"), 1, "%"))
+    q2.metric("Whiff%", fmt(sm.get("whiff_pct"), 1, "%"))
+    q3.metric("Opponent K%", fmt(team_split.get("calc_k_pct") or team_general.get("calc_k_pct"), 1, "%"))
+    q4.metric("SO Park Factor", fmt(park_so, 0))
 
-with st.expander("M4 \u00b7 Propensi\u00f3n del rival a poncharse \u2014 20%"):
-    a,b,c = st.columns(3)
-    a.metric("Opponent K%", fmt(team_general.get("calc_k_pct"),1,"%"))
-    b.metric("Opponent K% vs hand", fmt(team_split.get("calc_k_pct"),1,"%"))
-    c.metric("Confirmed lineup K%", fmt(lineup_k_pct(lineup),1,"%"))
-
-with st.expander("M5 \u00b7 Arsenal vs Matchup \u2014 15%"):
-    if sm["arsenal"]:
-        arsenal = pd.DataFrame(sm["arsenal"])
-        for col in ("Usage%","Velo","Whiff%"):
-            arsenal[col] = pd.to_numeric(arsenal[col], errors="coerce").round(1)
-        st.dataframe(arsenal[["Pitch","Usage%","Velo","Whiff%"]], hide_index=True, use_container_width=True)
-    else:
-        st.info("Statcast no devolvi\u00f3 arsenal.")
-
-with st.expander("M6 \u00b7 Forma / Cambios recientes \u2014 5%"):
-    if log:
-        st.dataframe(pd.DataFrame(log[:5]), hide_index=True, use_container_width=True)
-    else:
-        st.info("Sin game log reciente.")
-
-with st.expander("M7 \u00b7 Contexto \u2014 5%"):
-    a,b,c,d = st.columns(4)
-    a.metric("SO Park Factor", fmt(park_so,0))
-    b.metric("Temp", f"{context['temperature']}\u00b0F" if context.get("temperature") is not None else "N/A")
-    c.metric("Weather", context.get("condition") or "N/A")
-    d.metric("Umpire", context.get("umpire") or "N/A")
-    if park_so is None:
-        st.warning("Savant SO Park Factor no pudo cargarse en este intento. El modelo lo trata como neutral y NO inventa un valor.")
-    st.caption("Savant SO Park Factor: 100 = neutral. Weather y umpire se muestran, pero no reciben peso fuerte hasta validacion.")
-
-with st.expander("M8 \u00b7 Lineup confirmado \u2014 5%"):
-    if lineup:
-        view = pd.DataFrame(lineup)
-        view["K% vs hand"] = pd.to_numeric(view["K% vs hand"], errors="coerce").round(1)
-        st.dataframe(view[["#","Hitter","Bats","K% vs hand","PA","Source"]], hide_index=True, use_container_width=True)
-    else:
-        st.info("MLB todav\u00eda no public\u00f3 el batting order confirmado.")
-
-with st.expander("Fuentes de validaci\u00f3n \u00b7 FanGraphs / Baseball-Reference"):
-    validation = source_validation(mlb, fg, br)
-    if not validation.empty:
-        st.dataframe(validation, hide_index=True, use_container_width=True)
-    else:
-        st.info("FanGraphs/Baseball-Reference no devolvieron una fila coincidente para este pitcher.")
-
-# MARKET
-st.header("M9 \u00b7 Mercado \u00b7 DraftKings + FanDuel")
-st.caption("Introduce las l\u00edneas/odds actuales. La app compara autom\u00e1ticamente qu\u00e9 book ofrece mejor EV.")
-
-books = {}
-for book in ("DraftKings","FanDuel"):
-    st.subheader(book)
-    x,y,z = st.columns(3)
-    with x:
-        line = st.number_input(f"{book} \u00b7 L\u00ednea K", .5, 15.5, 5.5, 1.0, key=f"{book}_line")
-    with y:
-        over = st.number_input(f"{book} \u00b7 Over odds", -1000, 2000, -110, 5, key=f"{book}_over")
-    with z:
-        under = st.number_input(f"{book} \u00b7 Under odds", -1000, 2000, -110, 5, key=f"{book}_under")
-    books[book] = {"line": line, "over": over, "under": under}
-
-market_rows = []
-for book, q in books.items():
-    line = q["line"]
-    over_threshold = math.floor(line) + 1
-    under_max = math.floor(line)
-    p_over = poisson_ge(over_threshold, proj["central"])
-    p_under = poisson_cdf(under_max, proj["central"])
-
-    for side, prob, odds in (("OVER",p_over,q["over"]),("UNDER",p_under,q["under"])):
-        implied = american_implied(odds)
-        edge = prob*100 - implied if implied is not None else None
-        ev = ev_per_dollar(prob, odds)
-        market_rows.append({
-            "Book": book,
-            "Side": side,
-            "Line": line,
-            "Odds": odds,
-            "Model%": prob*100,
-            "Fair": fair_american(prob),
-            "Edge pp": edge,
-            "EV%": ev*100 if ev is not None else None,
+    st.subheader("Distribuci\u00f3n")
+    dist = []
+    for k in range(4, 10):
+        prob = poisson_ge(k, proj["central"])
+        dist.append({
+            "K": f"{k}+",
+            "Probability": f"{prob*100:.1f}%",
+            "Fair Odds": f"{fair_american(prob):+.0f}",
         })
+    st.dataframe(pd.DataFrame(dist), hide_index=True, use_container_width=True)
 
-market_df = pd.DataFrame(market_rows)
-for c in ("Model%","Fair","Edge pp","EV%"):
-    market_df[c] = pd.to_numeric(market_df[c], errors="coerce").round(1)
+with tab_modules:
+    with st.expander("M1 \u00b7 Capacidad real de K \u2014 20%", expanded=True):
+        a,b,c,d = st.columns(4)
+        a.metric("K%", fmt(mlb.get("calc_k_pct"),1,"%"))
+        a.metric("K-BB%", fmt(mlb.get("calc_k_minus_bb"),1,"%"))
+        b.metric("K/9", mlb.get("strikeoutsPer9Inn","N/A"))
+        b.metric("WHIP", mlb.get("whip","N/A"))
+        c.metric("Whiff%", fmt(sm.get("whiff_pct"),1,"%"))
+        c.metric("CSW%", fmt(sm.get("csw_pct"),1,"%"))
+        d.metric("Fastball Velo", fmt(sm.get("fastball_velo"),1," mph"))
+        fg_k_display = (
+            safe_num(fg.get("K%"))*100
+            if safe_num(fg.get("K%")) is not None and safe_num(fg.get("K%")) <= 1
+            else fg.get("K%")
+        )
+        d.metric("FanGraphs K%", fmt(fg_k_display,1,"%"))
 
-st.dataframe(market_df, hide_index=True, use_container_width=True)
+    with st.expander("M2 \u00b7 Volumen / Leash \u2014 20%"):
+        a,b,c,d = st.columns(4)
+        a.metric("GS", mlb.get("gamesStarted","N/A"))
+        a.metric("IP/start", fmt(mlb.get("calc_ip_start"),2))
+        b.metric("BF/start", fmt(mlb.get("calc_bf_start"),1))
+        b.metric("Avg BF L5", fmt(recent.get("avg_bf"),1))
+        c.metric("Avg Pitches L5", fmt(recent.get("avg_pitches"),1))
+        c.metric("Max Pitches L5", fmt(recent.get("max_pitches"),0))
+        d.metric("Avg K L5", fmt(recent.get("avg_k"),1))
+        d.metric("Avg IP L5", fmt(recent.get("avg_ip"),2))
 
-# DISTRIBUTION
-st.header("Distribuci\u00f3n P(4+\u20269+)")
-dist = []
-for k in range(4,10):
-    prob = poisson_ge(k, proj["central"])
-    dist.append({"K":f"{k}+","Probability":f"{prob*100:.1f}%","Fair Odds":f"{fair_american(prob):+.0f}"})
-st.dataframe(pd.DataFrame(dist), hide_index=True, use_container_width=True)
+    with st.expander("M3 \u00b7 Splits \u2014 10%"):
+        a,b,c,d = st.columns(4)
+        a.metric("K% vs LHB", fmt(sm.get("vs_l"),1,"%"))
+        b.metric("K% vs RHB", fmt(sm.get("vs_r"),1,"%"))
+        c.metric("K% Home", fmt(sm.get("home"),1,"%"))
+        d.metric("K% Away", fmt(sm.get("away"),1,"%"))
 
-# COMPLETENESS + BEST BET
-status = {
-    "M1": bool(mlb and not sc_df.empty),
-    "M2": bool(mlb and log),
-    "M3": bool(not sc_df.empty),
-    "M4": bool(team_general),
-    "M5": bool(sm["arsenal"]),
-    "M6": bool(log),
-    "M7": park_so is not None,
-    "M8": bool(lineup),
-    "M9": True,
-}
-completeness = sum(status.values())/9
+    with st.expander("M4 \u00b7 Propensi\u00f3n del rival \u2014 20%"):
+        a,b,c = st.columns(3)
+        a.metric("Opponent K%", fmt(team_general.get("calc_k_pct"),1,"%"))
+        b.metric("Opponent K% vs hand", fmt(team_split.get("calc_k_pct"),1,"%"))
+        c.metric("Confirmed lineup K%", fmt(lineup_k_pct(lineup),1,"%"))
 
-best = market_df.sort_values("EV%", ascending=False).iloc[0].to_dict()
-grade = grade_bet(safe_num(best.get("EV%"))/100 if safe_num(best.get("EV%")) is not None else None, safe_num(best.get("Edge pp")), completeness)
+    with st.expander("M5 \u00b7 Arsenal vs Matchup \u2014 15%"):
+        if sm["arsenal"]:
+            arsenal = pd.DataFrame(sm["arsenal"])
+            for col in ("Usage%","Velo","Whiff%"):
+                arsenal[col] = pd.to_numeric(arsenal[col], errors="coerce").round(1)
+            st.dataframe(
+                arsenal[["Pitch","Usage%","Velo","Whiff%"]],
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.info("Statcast no devolvi\u00f3 arsenal.")
 
-st.markdown(
-    f"""
-    <div class="bet-card">
-      <h2 style="margin-top:0">Mejor precio actual</h2>
-      <h1 style="margin:.2rem 0">{best['Side']} {best['Line']} K \u00b7 {best['Book']} {int(best['Odds']):+d}</h1>
-      <div>Modelo <b>{best['Model%']:.1f}%</b> \u00b7 Fair <b>{best['Fair']:+.0f}</b> \u00b7 Edge <b>{best['Edge pp']:.1f} pp</b> \u00b7 EV <b>{best['EV%']:.1f}%</b> \u00b7 Grade <b>{grade}</b></div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+    with st.expander("M6 \u00b7 Forma reciente \u2014 5%"):
+        if log:
+            st.dataframe(pd.DataFrame(log[:5]), hide_index=True, use_container_width=True)
+        else:
+            st.info("Sin game log reciente.")
 
-st.subheader("Estado de datos")
-st.progress(completeness)
-st.write(f"**{sum(status.values())}/9 m\u00f3dulos con datos disponibles**")
-st.caption(" \u00b7 ".join(f"{k} {'\u2705' if v else '\u23f3'}" for k,v in status.items()))
+    with st.expander("M7 \u00b7 Contexto \u2014 5%"):
+        a,b,c,d = st.columns(4)
+        a.metric("SO Park Factor", fmt(park_so,0))
+        b.metric("Temp", f"{context['temperature']}\u00b0F" if context.get("temperature") is not None else "N/A")
+        c.metric("Weather", context.get("condition") or "N/A")
+        d.metric("Umpire", context.get("umpire") or "N/A")
+        if park_so is None:
+            st.warning("Savant Park Factor no carg\u00f3; se trata como neutral.")
 
-st.info(
-    "V1.2 corrige encoding, fortalece Savant Park Factor y mejora el matching de FanGraphs/Baseball-Reference. "
-    "La siguiente fase ya no requiere reconstruir modulos: se enfoca en backtesting/calibracion de pesos y thresholds."
-)
+    with st.expander("M8 \u00b7 Lineup confirmado \u2014 5%"):
+        if lineup:
+            view = pd.DataFrame(lineup)
+            view["K% vs hand"] = pd.to_numeric(view["K% vs hand"], errors="coerce").round(1)
+            st.dataframe(
+                view[["#","Hitter","Bats","K% vs hand","PA","Source"]],
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.info("MLB todav\u00eda no public\u00f3 el batting order confirmado.")
+
+with tab_market:
+    st.subheader("Sportsbooks")
+    st.caption("Compara DraftKings y FanDuel. Action Network se usa como capa adicional de validaci\u00f3n.")
+
+    books = {}
+    for book in ("DraftKings", "FanDuel"):
+        st.markdown(f"### {book}")
+        x,y,z = st.columns(3)
+        with x:
+            line = st.number_input(
+                f"{book} \u00b7 L\u00ednea K",
+                min_value=.5,
+                max_value=15.5,
+                value=5.5,
+                step=1.0,
+                key=f"{book}_line_v13",
+            )
+        with y:
+            over = st.number_input(
+                f"{book} \u00b7 Over",
+                min_value=-1000,
+                max_value=2000,
+                value=-110,
+                step=5,
+                key=f"{book}_over_v13",
+            )
+        with z:
+            under = st.number_input(
+                f"{book} \u00b7 Under",
+                min_value=-1000,
+                max_value=2000,
+                value=-110,
+                step=5,
+                key=f"{book}_under_v13",
+            )
+        books[book] = {"line": line, "over": over, "under": under}
+
+    rows = []
+    for book, q in books.items():
+        line = q["line"]
+        over_threshold = math.floor(line) + 1
+        under_max = math.floor(line)
+        p_over = poisson_ge(over_threshold, proj["central"])
+        p_under = poisson_cdf(under_max, proj["central"])
+
+        for side, prob, odds in (
+            ("OVER", p_over, q["over"]),
+            ("UNDER", p_under, q["under"]),
+        ):
+            implied = american_implied(odds)
+            edge = prob*100 - implied if implied is not None else None
+            ev = ev_per_dollar(prob, odds)
+            rows.append({
+                "Book": book,
+                "Side": side,
+                "Line": line,
+                "Odds": odds,
+                "Model%": prob*100,
+                "Fair": fair_american(prob),
+                "Edge pp": edge,
+                "EV%": ev*100 if ev is not None else None,
+            })
+
+    market_df = pd.DataFrame(rows)
+    for col in ("Model%","Fair","Edge pp","EV%"):
+        market_df[col] = pd.to_numeric(market_df[col], errors="coerce").round(1)
+
+    st.dataframe(market_df, hide_index=True, use_container_width=True)
+
+    st.divider()
+    st.subheader("Action Network")
+
+    action_tables, action_status = action_network_public_props()
+    action_hits = action_pitcher_rows(action_tables, p["pitcher_name"])
+
+    st.markdown(
+        f"[Abrir Action Network \u00b7 MLB Pitching Props]({ACTION_PITCHING_PROPS_URL})"
+    )
+
+    if not action_hits.empty:
+        st.success("Se encontr\u00f3 una referencia p\u00fablica para este pitcher en Action Network.")
+        st.dataframe(action_hits, hide_index=True, use_container_width=True)
+    else:
+        st.caption(f"Lectura p\u00fablica: {action_status}. Los datos PRO se introducen abajo.")
+
+    ax1, ax2, ax3 = st.columns(3)
+    with ax1:
+        action_projection = st.number_input(
+            "Action PRO \u00b7 Proyecci\u00f3n K",
+            min_value=0.0,
+            max_value=15.0,
+            value=0.0,
+            step=.1,
+            help="Pon 0 si Action PRO no muestra proyecci\u00f3n.",
+        )
+        action_bets = st.number_input(
+            "Action \u00b7 % Bets",
+            min_value=0,
+            max_value=100,
+            value=50,
+            step=1,
+        )
+    with ax2:
+        action_money = st.number_input(
+            "Action \u00b7 % Money",
+            min_value=0,
+            max_value=100,
+            value=50,
+            step=1,
+        )
+        sharp_flag = st.checkbox("Sharp Action detectado")
+    with ax3:
+        action_line_move = st.number_input(
+            "Movimiento de l\u00ednea hacia OVER (+) / UNDER (-)",
+            min_value=-3.0,
+            max_value=3.0,
+            value=0.0,
+            step=.5,
+        )
+        action_side = st.selectbox("Lado evaluado", ["OVER", "UNDER"])
+
+    action_projection_value = action_projection if action_projection > 0 else None
+    signal = action_signal_score(
+        action_projection_value,
+        proj["central"],
+        action_bets,
+        action_money,
+        sharp_flag,
+        action_line_move,
+    )
+
+    st.metric("Action validation score", f"{signal:+.2f}")
+    st.caption(
+        "Este score es una capa de validaci\u00f3n y NO reemplaza la proyecci\u00f3n estad\u00edstica del modelo."
+    )
+
+    # Best bet from DK/FD only
+    best = market_df.sort_values("EV%", ascending=False).iloc[0].to_dict()
+
+    status = {
+        "M1": bool(mlb and not sc_df.empty),
+        "M2": bool(mlb and log),
+        "M3": bool(not sc_df.empty),
+        "M4": bool(team_general),
+        "M5": bool(sm["arsenal"]),
+        "M6": bool(log),
+        "M7": park_so is not None,
+        "M8": bool(lineup),
+        "M9": True,
+    }
+    completeness = sum(status.values()) / 9
+    grade = grade_bet(
+        safe_num(best.get("EV%"))/100 if safe_num(best.get("EV%")) is not None else None,
+        safe_num(best.get("Edge pp")),
+        completeness,
+    )
+
+    st.markdown(
+        f"""
+        <div class="best-card">
+          <div style="font-size:.78rem;opacity:.7">MEJOR PRECIO ACTUAL</div>
+          <div style="font-size:1.75rem;font-weight:850;margin:4px 0">
+            {best['Side']} {best['Line']} K \u00b7 {best['Book']} {int(best['Odds']):+d}
+          </div>
+          <div>
+            Modelo <b>{best['Model%']:.1f}%</b> \u00b7
+            Fair <b>{best['Fair']:+.0f}</b> \u00b7
+            Edge <b>{best['Edge pp']:.1f} pp</b> \u00b7
+            EV <b>{best['EV%']:.1f}%</b> \u00b7
+            Grade <b>{grade}</b>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with tab_sources:
+    st.subheader("Estado de fuentes")
+
+    validation = source_validation(mlb, fg, br)
+
+    src1, src2 = st.columns(2)
+    with src1:
+        st.markdown(
+            f"""
+            <div class="source-card">
+              <b>MLB Stats API</b><br>
+              <span style="opacity:.7">Estado: {'OK' if mlb else 'Sin datos'}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""
+            <div class="source-card">
+              <b>Baseball Savant / Statcast</b><br>
+              <span style="opacity:.7">Estado: {'OK' if not sc_df.empty else 'Sin datos'}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""
+            <div class="source-card">
+              <b>Baseball-Reference</b><br>
+              <span style="opacity:.7">Estado: {'OK' if br else 'Sin coincidencia'}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with src2:
+        st.markdown(
+            f"""
+            <div class="source-card">
+              <b>FanGraphs</b><br>
+              <span style="opacity:.7">Estado: {fg_status}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""
+            <div class="source-card">
+              <b>Savant SO Park Factor</b><br>
+              <span style="opacity:.7">Estado: {'OK \u00b7 '+fmt(park_so,0) if park_so is not None else 'No disponible'}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""
+            <div class="source-card">
+              <b>Action Network</b><br>
+              <span style="opacity:.7">Public props: {action_status}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if not validation.empty:
+        st.subheader("Cross-check estad\u00edstico")
+        st.dataframe(validation, hide_index=True, use_container_width=True)
+
+    st.info(
+        "FanGraphs puede bloquear solicitudes automatizadas con HTTP 403. "
+        "Cuando ocurre, el modelo contin\u00faa con MLB, Savant y Baseball-Reference sin inventar m\u00e9tricas."
+    )
+
+st.caption("V1.3 \u00b7 Base estable para validaci\u00f3n y backtesting.")
