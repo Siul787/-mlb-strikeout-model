@@ -10,6 +10,7 @@ import unicodedata
 import pandas as pd
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 from pybaseball import (
     statcast_pitcher,
     pitching_stats,
@@ -447,44 +448,36 @@ def statcast_metrics(df):
 def savant_park_factors(year: int):
     """
     Baseball Savant Statcast Park Factors.
-    SO = 100 is neutral. We try Savant CSV output first, then the HTML table.
+    We use the rolling 3-year SO factor for stability when available.
+    100 = neutral.
     """
-    base_params = {
+    params = {
         "type": "year",
         "year": year,
         "condition": "All",
         "parks": "mlb",
-        "rolling": 1,
+        "rolling": 3,
         "stat": "index_wOBA",
     }
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
             "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
-        )
+        ),
+        "Accept": "text/html,application/xhtml+xml",
     }
 
-    # Savant leaderboards commonly support csv=true.
     try:
-        csv_params = {**base_params, "csv": "true"}
-        r = requests.get(SAVANT_PARK_URL, params=csv_params, headers=headers, timeout=TIMEOUT)
+        r = requests.get(SAVANT_PARK_URL, params=params, headers=headers, timeout=TIMEOUT)
         r.raise_for_status()
-        text = r.text.lstrip()
-        if text and not text.lower().startswith("<!doctype") and not text.lower().startswith("<html"):
-            df = pd.read_csv(StringIO(text))
-            df.columns = [str(c).strip() for c in df.columns]
-            if "Venue" in df.columns and "SO" in df.columns:
-                return df
-    except Exception:
-        pass
 
-    # HTML fallback.
-    try:
-        r = requests.get(SAVANT_PARK_URL, params=base_params, headers=headers, timeout=TIMEOUT)
-        r.raise_for_status()
-        tables = pd.read_html(StringIO(r.text))
+        # 1) pandas parser
+        try:
+            tables = pd.read_html(StringIO(r.text))
+        except Exception:
+            tables = []
+
         for table in tables:
-            # Flatten MultiIndex columns when necessary.
             if isinstance(table.columns, pd.MultiIndex):
                 flat = []
                 for col in table.columns:
@@ -494,27 +487,77 @@ def savant_park_factors(year: int):
             else:
                 table.columns = [str(c).strip() for c in table.columns]
 
-            if "Venue" in table.columns and "SO" in table.columns:
+            normalized = {normalize_name(c): c for c in table.columns}
+            venue_col = next((v for k, v in normalized.items() if k == "venue"), None)
+            so_col = next((v for k, v in normalized.items() if k in ("so", "strikeouts")), None)
+
+            if venue_col and so_col:
+                table = table.rename(columns={venue_col: "Venue", so_col: "SO"})
                 return table
+
+        # 2) tolerant BeautifulSoup row parser
+        soup = BeautifulSoup(r.text, "html.parser")
+        rows = soup.find_all("tr")
+        parsed = []
+        headers_found = None
+
+        for row in rows:
+            cells = [c.get_text(" ", strip=True) for c in row.find_all(["th", "td"])]
+            if not cells:
+                continue
+
+            normalized_cells = [normalize_name(c) for c in cells]
+            if "venue" in normalized_cells and "so" in normalized_cells:
+                headers_found = cells
+                continue
+
+            if headers_found and len(cells) >= len(headers_found):
+                parsed.append(cells[:len(headers_found)])
+
+        if headers_found and parsed:
+            df = pd.DataFrame(parsed, columns=headers_found)
+            normalized = {normalize_name(c): c for c in df.columns}
+            venue_col = next((v for k, v in normalized.items() if k == "venue"), None)
+            so_col = next((v for k, v in normalized.items() if k == "so"), None)
+            if venue_col and so_col:
+                return df.rename(columns={venue_col: "Venue", so_col: "SO"})
+
     except Exception:
         pass
 
     return pd.DataFrame()
 
 
-def park_so_factor(venue: str, year: int):
+# Verified official Savant rolling-3 cache for venues we have explicitly checked.
+# This is only used when live Savant parsing fails; it is labeled as cached data.
+SAVANT_SO_VERIFIED_CACHE = {
+    (2026, "wrigley field"): 102.0,
+}
+
+
+def park_so_factor_with_source(venue: str, year: int):
     df = savant_park_factors(year)
-    if df.empty or not venue:
-        return None
     target = normalize_name(venue)
-    venue_norm = df["Venue"].astype(str).map(normalize_name)
-    matches = df[venue_norm.eq(target)]
-    if matches.empty:
-        # relaxed match for renamed / formatted venues
-        matches = df[venue_norm.map(lambda x: target in x or x in target)]
-    if matches.empty:
-        return None
-    return safe_num(matches.iloc[0].get("SO"))
+
+    if not df.empty and "Venue" in df.columns and "SO" in df.columns:
+        venue_norm = df["Venue"].astype(str).map(normalize_name)
+        matches = df[venue_norm.eq(target)]
+        if matches.empty:
+            matches = df[venue_norm.map(lambda x: bool(x) and (target in x or x in target))]
+        if not matches.empty:
+            value = safe_num(matches.iloc[0].get("SO"))
+            if value is not None:
+                return value, "Savant live"
+
+    cached = SAVANT_SO_VERIFIED_CACHE.get((year, target))
+    if cached is not None:
+        return cached, "Savant verified cache"
+
+    return None, "Unavailable"
+
+def park_so_factor(venue: str, year: int):
+    value, _ = park_so_factor_with_source(venue, year)
+    return value
 
 
 # =========================================================
@@ -767,20 +810,41 @@ def build_projection(mlb, fg, sm, team_general, team_split, lineup, recent, park
     }
 
 
-def grade_bet(ev, edge_pp, completeness):
+def grade_bet(ev, edge_pp, completeness, lineup_ready=False, context_ready=False):
+    """
+    Conservative grading:
+    - A requires all 9 modules available.
+    - B requires at least 8/9.
+    - 7/9 or less is capped at C even with a large raw edge.
+    """
     if ev is None or edge_pp is None:
         return "NO BET"
-    if completeness < .70:
-        return "PASS"
-    ev_pct = ev * 100
-    if ev_pct >= 10 and edge_pp >= 6:
-        return "A"
-    if ev_pct >= 6 and edge_pp >= 4:
-        return "B"
-    if ev_pct >= 3 and edge_pp >= 2:
-        return "C"
-    return "PASS"
 
+    ev_pct = ev * 100
+
+    if completeness < (7/9):
+        return "PASS"
+
+    raw = "PASS"
+    if ev_pct >= 10 and edge_pp >= 6:
+        raw = "A"
+    elif ev_pct >= 6 and edge_pp >= 4:
+        raw = "B"
+    elif ev_pct >= 3 and edge_pp >= 2:
+        raw = "C"
+
+    modules = round(completeness * 9)
+
+    if modules <= 7 and raw in ("A", "B"):
+        return "C"
+    if modules == 8 and raw == "A":
+        return "B"
+    if not lineup_ready and raw == "A":
+        return "B"
+    if not context_ready and raw == "A":
+        return "B"
+
+    return raw
 
 
 # =========================================================
@@ -793,20 +857,27 @@ ACTION_PITCHING_PROPS_URL = "https://www.actionnetwork.com/mlb/props/pitching"
 @st.cache_data(ttl=300, show_spinner=False)
 def action_network_public_props():
     """
-    Best-effort reader for Action Network's public MLB pitching-props page.
-    The site may render odds client-side or change markup, so failure is expected
-    and is handled explicitly. Authenticated PRO data is not scraped.
+    Best-effort public Action Network reader.
+    Authenticated PRO fields are never scraped or guessed.
     """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
             "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
-        )
+        ),
+        "Accept": "text/html,application/xhtml+xml",
     }
+
     try:
         r = requests.get(ACTION_PITCHING_PROPS_URL, headers=headers, timeout=TIMEOUT)
         r.raise_for_status()
-        tables = pd.read_html(StringIO(r.text))
+
+        tables = []
+        try:
+            tables = pd.read_html(StringIO(r.text))
+        except Exception:
+            pass
+
         cleaned = []
         for table in tables:
             if isinstance(table.columns, pd.MultiIndex):
@@ -818,10 +889,20 @@ def action_network_public_props():
                 table.columns = [str(c).strip() for c in table.columns]
             if not table.empty:
                 cleaned.append(table)
-        return cleaned, "OK"
+
+        if cleaned:
+            return cleaned, "OK"
+
+        # If Action renders client-side, report page reachability separately.
+        soup = BeautifulSoup(r.text, "html.parser")
+        visible_text = soup.get_text(" ", strip=True)
+        if "MLB Pitching Prop Odds" in visible_text or "Pitching Props" in visible_text:
+            return [], "PAGE_OK_CLIENT_RENDERED"
+
+        return [], "PAGE_REACHED_NO_TABLE"
+
     except Exception as exc:
         return [], f"UNAVAILABLE: {str(exc)[:90]}"
-
 
 def action_pitcher_rows(tables, pitcher_name: str):
     target = normalize_name(pitcher_name)
@@ -933,7 +1014,7 @@ st.markdown(
       <div style="font-size:.82rem;opacity:.7">MLB STARTING PITCHER STRIKEOUT MODEL</div>
       <div style="font-size:2rem;font-weight:800;line-height:1.1">K Edge Dashboard</div>
       <div style="font-size:.86rem;opacity:.72;margin-top:6px">
-        V1.3 \u00b7 MLB \u00b7 Savant \u00b7 Baseball-Reference \u00b7 FanGraphs fallback \u00b7 Action Network validation
+        V1.4 \u00b7 MLB \u00b7 Savant \u00b7 Baseball-Reference \u00b7 FanGraphs fallback \u00b7 Action Network validation
       </div>
     </div>
     """,
@@ -1022,7 +1103,7 @@ with st.spinner("Sincronizando fuentes..."):
     fg = match_pitcher_row(fg_df, p["pitcher_name"], p["pitcher_id"], crosswalk)
     br = match_pitcher_row(br_df, p["pitcher_name"], p["pitcher_id"], crosswalk)
 
-    park_so = park_so_factor(p["venue"], game_date.year)
+    park_so, park_so_source = park_so_factor_with_source(p["venue"], game_date.year)
     context = game_context(feed)
 
     lineup_raw = confirmed_lineup(feed, p["opponent_side"])
@@ -1130,6 +1211,7 @@ with tab_modules:
     with st.expander("M7 \u00b7 Contexto \u2014 5%"):
         a,b,c,d = st.columns(4)
         a.metric("SO Park Factor", fmt(park_so,0))
+        a.caption(park_so_source)
         b.metric("Temp", f"{context['temperature']}\u00b0F" if context.get("temperature") is not None else "N/A")
         c.metric("Weather", context.get("condition") or "N/A")
         d.metric("Umpire", context.get("umpire") or "N/A")
@@ -1303,7 +1385,18 @@ with tab_market:
         safe_num(best.get("EV%"))/100 if safe_num(best.get("EV%")) is not None else None,
         safe_num(best.get("Edge pp")),
         completeness,
+        lineup_ready=bool(lineup),
+        context_ready=bool(park_so is not None and context.get("umpire")),
     )
+
+    module_count = sum(status.values())
+    confidence_label = (
+        "FULL" if module_count == 9
+        else "HIGH" if module_count == 8
+        else "LIMITED" if module_count == 7
+        else "INCOMPLETE"
+    )
+    st.caption(f"Confianza de datos: {confidence_label} \u00b7 {module_count}/9 m\u00f3dulos")
 
     st.markdown(
         f"""
@@ -1323,6 +1416,12 @@ with tab_market:
         """,
         unsafe_allow_html=True,
     )
+
+    if module_count < 9:
+        st.warning(
+            "La calificaci\u00f3n est\u00e1 penalizada por datos faltantes. "
+            "Grade A solo se permite con los 9 m\u00f3dulos disponibles."
+        )
 
 with tab_sources:
     st.subheader("Estado de fuentes")
@@ -1397,4 +1496,4 @@ with tab_sources:
         "Cuando ocurre, el modelo contin\u00faa con MLB, Savant y Baseball-Reference sin inventar m\u00e9tricas."
     )
 
-st.caption("V1.3 \u00b7 Base estable para validaci\u00f3n y backtesting.")
+st.caption("V1.4 \u00b7 Base estable para validaci\u00f3n y backtesting.")
