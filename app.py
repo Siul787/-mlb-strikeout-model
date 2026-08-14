@@ -40,6 +40,7 @@ def fetch_pitcher_profile(player_id: int) -> dict:
         raise MLBApiError("The MLB Stats API did not return this pitcher's profile.")
     return people[0]
 
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_pitcher_season_stats(player_id: int, season: int) -> dict:
     payload = get_json(
@@ -64,27 +65,35 @@ def fetch_pitcher_season_stats(player_id: int, season: int) -> dict:
         return {}
 
     strikeouts = stat.get("strikeOuts")
+    walks = stat.get("baseOnBalls")
     batters_faced = stat.get("battersFaced")
 
     k_pct = None
-    if isinstance(strikeouts, (int, float)) and isinstance(batters_faced, (int, float)) and batters_faced > 0:
-        k_pct = (strikeouts / batters_faced) * 100
-
-    stat["calculatedKPercentage"] = k_pct
-    walks = stat.get("baseOnBalls")
-
     bb_pct = None
     k_minus_bb_pct = None
 
-    if isinstance(walks, (int, float)) and isinstance(batters_faced, (int, float)) and batters_faced > 0:
+    if (
+        isinstance(strikeouts, (int, float))
+        and isinstance(batters_faced, (int, float))
+        and batters_faced > 0
+    ):
+        k_pct = (strikeouts / batters_faced) * 100
+
+    if (
+        isinstance(walks, (int, float))
+        and isinstance(batters_faced, (int, float))
+        and batters_faced > 0
+    ):
         bb_pct = (walks / batters_faced) * 100
 
     if k_pct is not None and bb_pct is not None:
         k_minus_bb_pct = k_pct - bb_pct
 
-stat["calculatedBBPercentage"] = bb_pct
-stat["calculatedKMinusBBPercentage"] = k_minus_bb_pct
-        return stat
+    stat["calculatedKPercentage"] = k_pct
+    stat["calculatedBBPercentage"] = bb_pct
+    stat["calculatedKMinusBBPercentage"] = k_minus_bb_pct
+
+    return stat
 
 
 def format_game_time(game_date: str | None) -> str:
@@ -133,6 +142,7 @@ def fetch_pitchers_for_date(selected_date: str) -> dict:
             for side, opponent_side in (("away", "home"), ("home", "away")):
                 team_data = game_teams.get(side, {})
                 opponent_data = game_teams.get(opponent_side, {})
+
                 probable_pitcher = (
                     team_data.get("probablePitcher")
                     if isinstance(team_data, dict)
@@ -155,6 +165,7 @@ def fetch_pitchers_for_date(selected_date: str) -> dict:
                     continue
 
                 throwing_hand = "Not listed by MLB"
+
                 try:
                     profile = fetch_pitcher_profile(int(pitcher_id))
                     pitch_hand = profile.get("pitchHand", {})
@@ -168,7 +179,7 @@ def fetch_pitchers_for_date(selected_date: str) -> dict:
                 pitcher_options.append(
                     {
                         "selection_id": f"{game.get('gamePk')}-{side}-{pitcher_id}",
-        "pitcher_id": int(pitcher_id),
+                        "pitcher_id": int(pitcher_id),
                         "pitcher_name": pitcher_name,
                         "team": team.get("name", "Unknown team"),
                         "opponent": (
@@ -190,7 +201,7 @@ def fetch_pitchers_for_date(selected_date: str) -> dict:
 
 st.set_page_config(
     page_title="MLB Strikeout Predictor",
-    page_icon="MLB",
+    page_icon="⚾",
     layout="centered",
 )
 
@@ -240,6 +251,7 @@ if matchup_data["profile_errors"]:
     )
 
 pitcher_by_id = {pitcher["selection_id"]: pitcher for pitcher in pitchers}
+
 selected_id = st.selectbox(
     "Probable starting pitcher",
     options=list(pitcher_by_id),
@@ -250,6 +262,7 @@ selected_id = st.selectbox(
     ),
     help="Only probable starting pitchers returned by MLB for the selected date appear here.",
 )
+
 selected_pitcher = pitcher_by_id[selected_id]
 
 st.subheader("Selected matchup")
@@ -258,6 +271,7 @@ st.write(f"**Team:** {selected_pitcher['team']}")
 st.write(f"**Opponent:** {selected_pitcher['opponent']}")
 st.write(f"**Throwing hand:** {selected_pitcher['throwing_hand']}")
 st.write(f"**Game time:** {selected_pitcher['game_time']}")
+
 st.subheader("Pitcher Data")
 
 try:
@@ -304,24 +318,30 @@ try:
             st.metric(
                 "K% (calculated)",
                 f"{k_pct:.1f}%" if isinstance(k_pct, (int, float)) else "N/A",
- )
+            )
             st.metric(
-             "BB% (calculated)",
-             f"{bb_pct:.1f}%" if isinstance(bb_pct, (int, float)) else "N/A",
-)
+                "BB% (calculated)",
+                f"{bb_pct:.1f}%" if isinstance(bb_pct, (int, float)) else "N/A",
+            )
+            st.metric(
+                "K-BB% (calculated)",
+                (
+                    f"{k_minus_bb_pct:.1f}%"
+                    if isinstance(k_minus_bb_pct, (int, float))
+                    else "N/A"
+                ),
+            )
 
-            st.metric(
-            "K-BB% (calculated)",
-             f"{k_minus_bb_pct:.1f}%" if isinstance(k_minus_bb_pct, (int, float)) else "N/A",
-)
-            st.caption(
-            "K% is calculated as strikeouts ÷ batters faced × 100. "
+        st.caption(
+            "K% and BB% are calculated from season totals. "
+            "K-BB% equals K% minus BB%. "
             "All other statistics are loaded from the MLB Stats API."
-        ) 
-except MLBApiError as exc:
-            st.warning(f"Pitcher season statistics could not be loaded: {exc}")
+        )
 
-            st.info(
-             "The strikeout prediction model is disabled for now. "
-             "No prediction is being calculated."
+except MLBApiError as exc:
+    st.warning(f"Pitcher season statistics could not be loaded: {exc}")
+
+st.info(
+    "The strikeout prediction model is disabled for now. "
+    "No prediction is being calculated."
 )
