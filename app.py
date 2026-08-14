@@ -14,6 +14,7 @@ from pybaseball import (
     statcast_pitcher,
     pitching_stats,
     pitching_stats_bref,
+    playerid_lookup,
 )
 
 # =========================================================
@@ -41,7 +42,7 @@ PITCH_NAMES = {
 
 st.set_page_config(
     page_title="MLB K Model",
-    page_icon="â¾",
+    page_icon="\u26be",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -283,7 +284,7 @@ def game_time_label(raw):
         return "TBD"
     try:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return dt.astimezone(timezone.utc).strftime("%b %d Â· %I:%M %p UTC").replace(" 0", " ")
+        return dt.astimezone(timezone.utc).strftime("%b %d \u00b7 %I:%M %p UTC").replace(" 0", " ")
     except ValueError:
         return "TBD"
 
@@ -444,19 +445,60 @@ def statcast_metrics(df):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def savant_park_factors(year: int):
-    # Baseball Savant publishes a table whose SO column uses 100 as league average.
-    params = {"type": "year", "year": year, "condition": "All", "parks": "mlb", "rolling": 3}
+    """
+    Baseball Savant Statcast Park Factors.
+    SO = 100 is neutral. We try Savant CSV output first, then the HTML table.
+    """
+    base_params = {
+        "type": "year",
+        "year": year,
+        "condition": "All",
+        "parks": "mlb",
+        "rolling": 1,
+        "stat": "index_wOBA",
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
+        )
+    }
+
+    # Savant leaderboards commonly support csv=true.
     try:
-        r = requests.get(SAVANT_PARK_URL, params=params, timeout=TIMEOUT)
+        csv_params = {**base_params, "csv": "true"}
+        r = requests.get(SAVANT_PARK_URL, params=csv_params, headers=headers, timeout=TIMEOUT)
+        r.raise_for_status()
+        text = r.text.lstrip()
+        if text and not text.lower().startswith("<!doctype") and not text.lower().startswith("<html"):
+            df = pd.read_csv(StringIO(text))
+            df.columns = [str(c).strip() for c in df.columns]
+            if "Venue" in df.columns and "SO" in df.columns:
+                return df
+    except Exception:
+        pass
+
+    # HTML fallback.
+    try:
+        r = requests.get(SAVANT_PARK_URL, params=base_params, headers=headers, timeout=TIMEOUT)
         r.raise_for_status()
         tables = pd.read_html(StringIO(r.text))
         for table in tables:
-            cols = [str(c).strip() for c in table.columns]
-            if "Venue" in cols and "SO" in cols:
-                table.columns = cols
+            # Flatten MultiIndex columns when necessary.
+            if isinstance(table.columns, pd.MultiIndex):
+                flat = []
+                for col in table.columns:
+                    parts = [str(x).strip() for x in col if str(x).strip() and str(x) != "nan"]
+                    flat.append(parts[-1] if parts else "")
+                table.columns = flat
+            else:
+                table.columns = [str(c).strip() for c in table.columns]
+
+            if "Venue" in table.columns and "SO" in table.columns:
                 return table
     except Exception:
         pass
+
     return pd.DataFrame()
 
 
@@ -481,15 +523,22 @@ def park_so_factor(venue: str, year: int):
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def fangraphs_pitchers(season: int):
+    """
+    pybaseball season leaderboard backed by FanGraphs.
+    FanGraphs can occasionally return HTTP 403 to automated requests; we expose
+    that state instead of silently pretending the value exists.
+    """
     try:
-        return pitching_stats(season, season, qual=0)
-    except TypeError:
         try:
-            return pitching_stats(season, season)
-        except Exception:
-            return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+            df = pitching_stats(season, season, qual=0)
+        except TypeError:
+            df = pitching_stats(season, season)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df, "OK"
+        return pd.DataFrame(), "EMPTY"
+    except Exception as exc:
+        msg = str(exc)
+        return pd.DataFrame(), ("BLOCKED_403" if "403" in msg else f"ERROR: {msg[:90]}")
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -500,24 +549,75 @@ def bref_pitchers(season: int):
         return pd.DataFrame()
 
 
-def match_pitcher_row(df: pd.DataFrame, name: str, mlbam_id: int | None = None):
+@st.cache_data(ttl=86400, show_spinner=False)
+def player_crosswalk(name: str):
+    """
+    Resolve MLBAM -> FanGraphs / Baseball-Reference identifiers via Chadwick data
+    exposed by pybaseball.
+    """
+    parts = str(name).strip().split()
+    if len(parts) < 2:
+        return {}
+    first = " ".join(parts[:-1])
+    last = parts[-1]
+    try:
+        df = playerid_lookup(last, first, fuzzy=True)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            # Prefer exact normalized full-name match when possible.
+            target = normalize_name(name)
+            for _, row in df.iterrows():
+                full = f"{row.get('name_first','')} {row.get('name_last','')}"
+                if normalize_name(full) == target:
+                    return row.to_dict()
+            return df.iloc[0].to_dict()
+    except Exception:
+        pass
+    return {}
+
+
+def match_pitcher_row(df: pd.DataFrame, name: str, mlbam_id: int | None = None, crosswalk: dict | None = None):
     if df.empty:
         return {}
 
+    crosswalk = crosswalk or {}
+
+    # Direct MLBAM columns (common for Baseball-Reference outputs).
     if mlbam_id is not None:
-        for col in ("mlbID", "MLBAMID", "mlb_ID"):
+        for col in ("mlbID", "MLBAMID", "mlb_ID", "key_mlbam"):
             if col in df.columns:
                 ids = pd.to_numeric(df[col], errors="coerce")
                 hit = df[ids.eq(int(mlbam_id))]
                 if not hit.empty:
                     return hit.iloc[0].to_dict()
 
-    name_col = next((c for c in ("Name","NameASCII","name_common") if c in df.columns), None)
-    if not name_col:
-        return {}
-    target = normalize_name(name)
-    hit = df[df[name_col].astype(str).map(normalize_name).eq(target)]
-    return hit.iloc[0].to_dict() if not hit.empty else {}
+    # FanGraphs ID match.
+    fg_id = safe_num(crosswalk.get("key_fangraphs"))
+    if fg_id is not None:
+        for col in ("IDfg", "key_fangraphs"):
+            if col in df.columns:
+                ids = pd.to_numeric(df[col], errors="coerce")
+                hit = df[ids.eq(int(fg_id))]
+                if not hit.empty:
+                    return hit.iloc[0].to_dict()
+
+    # Baseball-Reference ID match.
+    br_id = str(crosswalk.get("key_bbref") or "").strip()
+    if br_id:
+        for col in ("player_ID", "key_bbref"):
+            if col in df.columns:
+                hit = df[df[col].astype(str).str.strip().eq(br_id)]
+                if not hit.empty:
+                    return hit.iloc[0].to_dict()
+
+    # Exact normalized name.
+    name_col = next((c for c in ("Name", "NameASCII", "name_common") if c in df.columns), None)
+    if name_col:
+        target = normalize_name(name)
+        hit = df[df[name_col].astype(str).map(normalize_name).eq(target)]
+        if not hit.empty:
+            return hit.iloc[0].to_dict()
+
+    return {}
 
 
 def source_validation(mlb, fg, br):
@@ -689,8 +789,8 @@ def grade_bet(ev, edge_pp, completeness):
 st.markdown(
     """
     <div class="hero">
-      <h1 style="margin:0">â¾ MLB Starting Pitcher K Model</h1>
-      <div class="muted">V1.1 Â· MLB + Baseball Savant + FanGraphs + Baseball-Reference Â· DraftKings + FanDuel</div>
+      <h1 style="margin:0">\u26be MLB Starting Pitcher K Model</h1>
+      <div class="muted">V1.2 \u00b7 MLB + Baseball Savant + FanGraphs + Baseball-Reference \u00b7 DraftKings + FanDuel</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -707,7 +807,7 @@ except Exception as exc:
     st.stop()
 
 if not options:
-    st.warning("MLB todavÃ­a no tiene abridores probables disponibles para esta fecha.")
+    st.warning("MLB todav\u00eda no tiene abridores probables disponibles para esta fecha.")
     st.stop()
 
 by_id = {p["selection_id"]: p for p in options}
@@ -715,7 +815,7 @@ with top2:
     selected_id = st.selectbox(
         "Abridor",
         list(by_id),
-        format_func=lambda x: f"{by_id[x]['pitcher_name']} Â· {by_id[x]['team']} vs {by_id[x]['opponent']}",
+        format_func=lambda x: f"{by_id[x]['pitcher_name']} \u00b7 {by_id[x]['team']} vs {by_id[x]['opponent']}",
     )
 
 p = by_id[selected_id]
@@ -724,7 +824,7 @@ st.markdown(
     f"""
     <div class="hero">
       <h2 style="margin:0">{p['pitcher_name']} <span style="opacity:.55">vs {p['opponent']}</span></h2>
-      <div class="muted">{p['team']} Â· {p['throwing_hand']} Â· {p['venue']} Â· {p['game_time']} Â· {p['status']}</div>
+      <div class="muted">{p['team']} \u00b7 {p['throwing_hand']} \u00b7 {p['venue']} \u00b7 {p['game_time']} \u00b7 {p['status']}</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -760,10 +860,11 @@ with st.spinner("Cargando fuentes..."):
     sc_df = statcast_data(p["pitcher_id"], f"{game_date.year}-03-01", game_date.isoformat())
     sm = statcast_metrics(sc_df)
 
-    fg_df = fangraphs_pitchers(game_date.year)
+    fg_df, fg_status = fangraphs_pitchers(game_date.year)
     br_df = bref_pitchers(game_date.year)
-    fg = match_pitcher_row(fg_df, p["pitcher_name"], p["pitcher_id"])
-    br = match_pitcher_row(br_df, p["pitcher_name"], p["pitcher_id"])
+    crosswalk = player_crosswalk(p["pitcher_name"])
+    fg = match_pitcher_row(fg_df, p["pitcher_name"], p["pitcher_id"], crosswalk)
+    br = match_pitcher_row(br_df, p["pitcher_name"], p["pitcher_id"], crosswalk)
 
     park_so = park_so_factor(p["venue"], game_date.year)
     context = game_context(feed)
@@ -776,14 +877,14 @@ proj = build_projection(mlb, fg, sm, team_general, team_split, lineup, recent, p
 
 # MAIN SUMMARY
 s1, s2, s3, s4, s5 = st.columns(5)
-s1.metric("ProyecciÃ³n", fmt(proj["central"], 2, " K"))
-s2.metric("Rango", f"{proj['low']:.1f}â{proj['high']:.1f}")
+s1.metric("Proyecci\u00f3n", fmt(proj["central"], 2, " K"))
+s2.metric("Rango", f"{proj['low']:.1f}\u2013{proj['high']:.1f}")
 s3.metric("Projected BF", fmt(proj["bf"], 1))
 s4.metric("Projected K%", fmt(proj["k_pct"], 1, "%"))
 s5.metric("SO Park Factor", fmt(park_so, 0))
 
 # MODULES
-with st.expander("M1 Â· Capacidad real de K â 20%", expanded=True):
+with st.expander("M1 \u00b7 Capacidad real de K \u2014 20%", expanded=True):
     a,b,c,d = st.columns(4)
     a.metric("K%", fmt(mlb.get("calc_k_pct"),1,"%"))
     a.metric("K-BB%", fmt(mlb.get("calc_k_minus_bb"),1,"%"))
@@ -792,9 +893,12 @@ with st.expander("M1 Â· Capacidad real de K â 20%", expanded=True):
     c.metric("Whiff%", fmt(sm.get("whiff_pct"),1,"%"))
     c.metric("CSW%", fmt(sm.get("csw_pct"),1,"%"))
     d.metric("Fastball Velo", fmt(sm.get("fastball_velo"),1," mph"))
-    d.metric("FanGraphs K%", fmt((safe_num(fg.get("K%"))*100 if safe_num(fg.get("K%")) is not None and safe_num(fg.get("K%"))<=1 else fg.get("K%")),1,"%"))
+    fg_k_display = (safe_num(fg.get("K%"))*100 if safe_num(fg.get("K%")) is not None and safe_num(fg.get("K%")) <= 1 else fg.get("K%"))
+    d.metric("FanGraphs K%", fmt(fg_k_display, 1, "%"))
+    if fg_status != "OK":
+        d.caption("FanGraphs source: " + fg_status)
 
-with st.expander("M2 Â· Volumen / Leash â 20%"):
+with st.expander("M2 \u00b7 Volumen / Leash \u2014 20%"):
     a,b,c,d = st.columns(4)
     a.metric("GS", mlb.get("gamesStarted","N/A"))
     a.metric("IP/start", fmt(mlb.get("calc_ip_start"),2))
@@ -805,51 +909,53 @@ with st.expander("M2 Â· Volumen / Leash â 20%"):
     d.metric("Avg K L5", fmt(recent.get("avg_k"),1))
     d.metric("Avg IP L5", fmt(recent.get("avg_ip"),2))
 
-with st.expander("M3 Â· Splits â 10%"):
+with st.expander("M3 \u00b7 Splits \u2014 10%"):
     a,b,c,d = st.columns(4)
     a.metric("K% vs LHB", fmt(sm.get("vs_l"),1,"%"))
     b.metric("K% vs RHB", fmt(sm.get("vs_r"),1,"%"))
     c.metric("K% Home", fmt(sm.get("home"),1,"%"))
     d.metric("K% Away", fmt(sm.get("away"),1,"%"))
 
-with st.expander("M4 Â· PropensiÃ³n del rival a poncharse â 20%"):
+with st.expander("M4 \u00b7 Propensi\u00f3n del rival a poncharse \u2014 20%"):
     a,b,c = st.columns(3)
     a.metric("Opponent K%", fmt(team_general.get("calc_k_pct"),1,"%"))
     b.metric("Opponent K% vs hand", fmt(team_split.get("calc_k_pct"),1,"%"))
     c.metric("Confirmed lineup K%", fmt(lineup_k_pct(lineup),1,"%"))
 
-with st.expander("M5 Â· Arsenal vs Matchup â 15%"):
+with st.expander("M5 \u00b7 Arsenal vs Matchup \u2014 15%"):
     if sm["arsenal"]:
         arsenal = pd.DataFrame(sm["arsenal"])
         for col in ("Usage%","Velo","Whiff%"):
             arsenal[col] = pd.to_numeric(arsenal[col], errors="coerce").round(1)
         st.dataframe(arsenal[["Pitch","Usage%","Velo","Whiff%"]], hide_index=True, use_container_width=True)
     else:
-        st.info("Statcast no devolviÃ³ arsenal.")
+        st.info("Statcast no devolvi\u00f3 arsenal.")
 
-with st.expander("M6 Â· Forma / Cambios recientes â 5%"):
+with st.expander("M6 \u00b7 Forma / Cambios recientes \u2014 5%"):
     if log:
         st.dataframe(pd.DataFrame(log[:5]), hide_index=True, use_container_width=True)
     else:
         st.info("Sin game log reciente.")
 
-with st.expander("M7 Â· Contexto â 5%"):
+with st.expander("M7 \u00b7 Contexto \u2014 5%"):
     a,b,c,d = st.columns(4)
     a.metric("SO Park Factor", fmt(park_so,0))
-    b.metric("Temp", f"{context['temperature']}Â°F" if context.get("temperature") is not None else "N/A")
+    b.metric("Temp", f"{context['temperature']}\u00b0F" if context.get("temperature") is not None else "N/A")
     c.metric("Weather", context.get("condition") or "N/A")
     d.metric("Umpire", context.get("umpire") or "N/A")
-    st.caption("Savant SO Park Factor: 100 = neutral. Weather y umpire se muestran, pero todavÃ­a no reciben peso fuerte hasta validaciÃ³n.")
+    if park_so is None:
+        st.warning("Savant SO Park Factor no pudo cargarse en este intento. El modelo lo trata como neutral y NO inventa un valor.")
+    st.caption("Savant SO Park Factor: 100 = neutral. Weather y umpire se muestran, pero no reciben peso fuerte hasta validacion.")
 
-with st.expander("M8 Â· Lineup confirmado â 5%"):
+with st.expander("M8 \u00b7 Lineup confirmado \u2014 5%"):
     if lineup:
         view = pd.DataFrame(lineup)
         view["K% vs hand"] = pd.to_numeric(view["K% vs hand"], errors="coerce").round(1)
         st.dataframe(view[["#","Hitter","Bats","K% vs hand","PA","Source"]], hide_index=True, use_container_width=True)
     else:
-        st.info("MLB todavÃ­a no publicÃ³ el batting order confirmado.")
+        st.info("MLB todav\u00eda no public\u00f3 el batting order confirmado.")
 
-with st.expander("Fuentes de validaciÃ³n Â· FanGraphs / Baseball-Reference"):
+with st.expander("Fuentes de validaci\u00f3n \u00b7 FanGraphs / Baseball-Reference"):
     validation = source_validation(mlb, fg, br)
     if not validation.empty:
         st.dataframe(validation, hide_index=True, use_container_width=True)
@@ -857,19 +963,19 @@ with st.expander("Fuentes de validaciÃ³n Â· FanGraphs / Baseball-Reference")
         st.info("FanGraphs/Baseball-Reference no devolvieron una fila coincidente para este pitcher.")
 
 # MARKET
-st.header("M9 Â· Mercado Â· DraftKings + FanDuel")
-st.caption("Introduce las lÃ­neas/odds actuales. La app compara automÃ¡ticamente quÃ© book ofrece mejor EV.")
+st.header("M9 \u00b7 Mercado \u00b7 DraftKings + FanDuel")
+st.caption("Introduce las l\u00edneas/odds actuales. La app compara autom\u00e1ticamente qu\u00e9 book ofrece mejor EV.")
 
 books = {}
 for book in ("DraftKings","FanDuel"):
     st.subheader(book)
     x,y,z = st.columns(3)
     with x:
-        line = st.number_input(f"{book} Â· LÃ­nea K", .5, 15.5, 5.5, 1.0, key=f"{book}_line")
+        line = st.number_input(f"{book} \u00b7 L\u00ednea K", .5, 15.5, 5.5, 1.0, key=f"{book}_line")
     with y:
-        over = st.number_input(f"{book} Â· Over odds", -1000, 2000, -110, 5, key=f"{book}_over")
+        over = st.number_input(f"{book} \u00b7 Over odds", -1000, 2000, -110, 5, key=f"{book}_over")
     with z:
-        under = st.number_input(f"{book} Â· Under odds", -1000, 2000, -110, 5, key=f"{book}_under")
+        under = st.number_input(f"{book} \u00b7 Under odds", -1000, 2000, -110, 5, key=f"{book}_under")
     books[book] = {"line": line, "over": over, "under": under}
 
 market_rows = []
@@ -902,7 +1008,7 @@ for c in ("Model%","Fair","Edge pp","EV%"):
 st.dataframe(market_df, hide_index=True, use_container_width=True)
 
 # DISTRIBUTION
-st.header("DistribuciÃ³n P(4+â¦9+)")
+st.header("Distribuci\u00f3n P(4+\u20269+)")
 dist = []
 for k in range(4,10):
     prob = poisson_ge(k, proj["central"])
@@ -930,8 +1036,8 @@ st.markdown(
     f"""
     <div class="bet-card">
       <h2 style="margin-top:0">Mejor precio actual</h2>
-      <h1 style="margin:.2rem 0">{best['Side']} {best['Line']} K Â· {best['Book']} {int(best['Odds']):+d}</h1>
-      <div>Modelo <b>{best['Model%']:.1f}%</b> Â· Fair <b>{best['Fair']:+.0f}</b> Â· Edge <b>{best['Edge pp']:.1f} pp</b> Â· EV <b>{best['EV%']:.1f}%</b> Â· Grade <b>{grade}</b></div>
+      <h1 style="margin:.2rem 0">{best['Side']} {best['Line']} K \u00b7 {best['Book']} {int(best['Odds']):+d}</h1>
+      <div>Modelo <b>{best['Model%']:.1f}%</b> \u00b7 Fair <b>{best['Fair']:+.0f}</b> \u00b7 Edge <b>{best['Edge pp']:.1f} pp</b> \u00b7 EV <b>{best['EV%']:.1f}%</b> \u00b7 Grade <b>{grade}</b></div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -939,10 +1045,9 @@ st.markdown(
 
 st.subheader("Estado de datos")
 st.progress(completeness)
-st.write(f"**{sum(status.values())}/9 mÃ³dulos con datos disponibles**")
-st.caption(" Â· ".join(f"{k} {'â' if v else 'â³'}" for k,v in status.items()))
+st.write(f"**{sum(status.values())}/9 m\u00f3dulos con datos disponibles**")
+st.caption(" \u00b7 ".join(f"{k} {'\u2705' if v else '\u23f3'}" for k,v in status.items()))
 
 st.info(
-    "V1.1 integra las fuentes y el mercado en una sola app. "
-    "La siguiente fase ya no requiere reconstruir mÃ³dulos: se enfoca en backtesting/calibraciÃ³n de pesos y thresholds."
-)
+    "V1.2 corrige encoding, fortalece Savant Park Factor y mejora el matching de FanGraphs/Baseball-Reference. "
+    "La siguiente fase ya no requiere reconstruir m\u00f3dulos: se enfoca en backtesting/calibraci\u00f3n de pesos y thresholds."
