@@ -1,6 +1,6 @@
 streamlit
 requests
 pandas
-pybaseball
+pybaseball>=2.2.7
 lxml
 beautifulsoup4
