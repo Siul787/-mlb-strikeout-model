@@ -1050,4 +1050,5 @@ st.caption(" \u00b7 ".join(f"{k} {'\u2705' if v else '\u23f3'}" for k,v in statu
 
 st.info(
     "V1.2 corrige encoding, fortalece Savant Park Factor y mejora el matching de FanGraphs/Baseball-Reference. "
-    "La siguiente fase ya no requiere reconstruir m\u00f3dulos: se enfoca en backtesting/calibraci\u00f3n de pesos y thresholds."
+    "La siguiente fase ya no requiere reconstruir modulos: se enfoca en backtesting/calibracion de pesos y thresholds."
+)
