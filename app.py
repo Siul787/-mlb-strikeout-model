@@ -84,7 +84,7 @@ def fetch_pitcher_season_stats(player_id: int, season: int) -> dict:
 
 stat["calculatedBBPercentage"] = bb_pct
 stat["calculatedKMinusBBPercentage"] = k_minus_bb_pct
-return stat
+        return stat
 
 
 def format_game_time(game_date: str | None) -> str:
