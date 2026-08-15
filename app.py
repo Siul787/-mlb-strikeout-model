@@ -27,7 +27,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.2.1 LIVE VALIDATION
+# V3.2.2 LIVE VALIDATION
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -484,21 +484,117 @@ def game_context(feed):
     }
 
 
-def confirmed_lineup(feed, side):
-    box = feed.get("liveData", {}).get("boxscore", {}).get("teams", {}).get(side, {})
-    order = box.get("battingOrder", [])
-    players = box.get("players", {})
+@st.cache_data(ttl=300, show_spinner=False)
+def team_roster_player_ids(team_id: int, season: int, roster_date: str):
+    """Return the official MLB roster IDs for the expected opponent team.
+
+    M8 is fail-closed: if we cannot independently verify the team roster,
+    the lineup is not allowed into the projection.
+    """
+    if not team_id:
+        return set(), "NO_TEAM_ID"
+
+    # Active is the preferred source. 40-man is a conservative fallback for
+    # edge cases around same-day activations while still preventing cross-team mixes.
+    for roster_type in ("active", "40Man"):
+        try:
+            d = get_json(
+                f"{MLB_TEAMS_URL}/{int(team_id)}/roster",
+                params={
+                    "rosterType": roster_type,
+                    "season": int(season),
+                    "date": str(roster_date),
+                },
+            )
+            ids = {
+                int(r.get("person", {}).get("id"))
+                for r in (d.get("roster", []) or [])
+                if r.get("person", {}).get("id")
+            }
+            if len(ids) >= 9:
+                return ids, f"MLB_{roster_type.upper()}_ROSTER"
+        except Exception:
+            continue
+
+    return set(), "ROSTER_UNAVAILABLE"
+
+
+def confirmed_lineup(feed, side, expected_team_id, season, roster_date):
+    """Read and validate the nine-man batting order for the expected opponent.
+
+    Guard rails:
+    1) the boxscore side must be the expected MLB team,
+    2) battingOrder must contain exactly nine distinct players,
+    3) every player must exist in that side's boxscore player dictionary,
+    4) every player must also appear on MLB's roster for the expected team/date.
+
+    Any failure returns an empty lineup so M8 cannot contaminate M3/M8/projection.
+    """
+    teams_box = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
+    box = teams_box.get(side, {}) if isinstance(teams_box, dict) else {}
+
+    # Cross-check team identity in two independent parts of the game feed.
+    box_team_id = safe_num((box.get("team") or {}).get("id"))
+    game_team_id = safe_num(
+        (((feed.get("gameData", {}) or {}).get("teams", {}) or {}).get(side, {}) or {}).get("id")
+    )
+    expected = safe_num(expected_team_id)
+
+    observed_ids = [x for x in (box_team_id, game_team_id) if x is not None]
+    if expected is None:
+        return [], "LINEUP GUARD: expected opponent Team ID missing"
+    if observed_ids and any(int(x) != int(expected) for x in observed_ids):
+        return [], f"LINEUP GUARD: team mismatch (expected {int(expected)})"
+    if not observed_ids:
+        return [], "LINEUP GUARD: game feed team identity unavailable"
+
+    order = box.get("battingOrder", []) or []
+    players = box.get("players", {}) or {}
+
+    try:
+        order_ids = [int(pid) for pid in order]
+    except Exception:
+        return [], "LINEUP GUARD: invalid battingOrder IDs"
+
+    if len(order_ids) != 9:
+        return [], f"LINEUP NOT CONFIRMED: expected 9 hitters, found {len(order_ids)}"
+    if len(set(order_ids)) != 9:
+        return [], "LINEUP GUARD: duplicate hitter IDs detected"
+
+    roster_ids, roster_source = team_roster_player_ids(
+        int(expected), int(season), str(roster_date)
+    )
+    if not roster_ids:
+        return [], f"LINEUP GUARD: official opponent roster unavailable ({roster_source})"
+
     rows = []
-    for i, pid in enumerate(order, 1):
-        p = players.get(f"ID{pid}", {})
-        person = p.get("person", {})
+    invalid = []
+    for i, pid in enumerate(order_ids, 1):
+        player_obj = players.get(f"ID{pid}", {}) or {}
+        person = player_obj.get("person", {}) or {}
+        name = person.get("fullName")
+
+        if not name:
+            invalid.append(f"ID{pid}: missing from {side} boxscore players")
+            continue
+        if pid not in roster_ids:
+            invalid.append(f"{name} ({pid}): not on expected team roster")
+            continue
+
         rows.append({
             "#": i,
-            "player_id": int(pid),
-            "Hitter": person.get("fullName", f"Player {pid}"),
-            "Bats": person.get("batSide", {}).get("code","N/A"),
+            "player_id": pid,
+            "Hitter": name,
+            "Bats": (person.get("batSide") or {}).get("code", "N/A"),
         })
-    return rows
+
+    if invalid or len(rows) != 9:
+        detail = "; ".join(invalid[:3])
+        if len(invalid) > 3:
+            detail += f"; +{len(invalid)-3} more"
+        return [], f"LINEUP GUARD REJECTED: {detail or 'validation incomplete'}"
+
+    return rows, f"VERIFIED · Team {int(expected)} · 9/9 · {roster_source}"
 
 
 
@@ -2017,7 +2113,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.1 LIVE VALIDATION · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.2 LIVE VALIDATION · Lineup Team Guard · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2233,7 +2329,13 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
 
     park_so,park_source=park_so_factor(p["venue"],game_date.year)
 
-    raw_lineup=confirmed_lineup(feed,p["opponent_side"])
+    raw_lineup, lineup_guard_status = confirmed_lineup(
+        feed,
+        p["opponent_side"],
+        p["opponent_id"],
+        game_date.year,
+        game_date.isoformat(),
+    )
     lineup=enrich_lineup(raw_lineup,game_date.year,cutoff_str,p["throwing_hand"]) if raw_lineup else []
 
     recent=recent_summary(log)
@@ -2420,6 +2522,7 @@ with tab_modules:
 
     with st.expander("M8 · Lineup confirmado — 5%"):
         if lineup:
+            st.success(f"Lineup Team Guard: {lineup_guard_status}")
             ldf=pd.DataFrame(lineup)
             st.dataframe(ldf[["#","Hitter","Bats","K% vs hand","PA","Contact%","Whiff%","Source"]],hide_index=True,use_container_width=True)
             high=[r["Hitter"] for r in lineup if safe_num(r.get("K% vs hand")) is not None and r["K% vs hand"]>=27]
@@ -2427,7 +2530,7 @@ with tab_modules:
             st.write("**High-K hitters:** "+(", ".join(high) if high else "None flagged"))
             st.write("**Low-K hitters:** "+(", ".join(low) if low else "None flagged"))
         else:
-            st.warning("NO cerrar análisis definitivo: lineup real todavía no está confirmado.")
+            st.warning(f"NO cerrar análisis definitivo: {lineup_guard_status}")
         lineup_notes=st.text_area("Ausencias / sustituciones / diferencias vs lineup habitual",key="lineup_notes")
 
 # ------------------------------------------------------------
@@ -2701,6 +2804,7 @@ with tab_sources:
     st.subheader("Fuentes y estado")
     src=pd.DataFrame([
         {"Fuente":"MLB Stats API","Uso":"Schedule, probables, season-to-date, logs, lineup, weather, umpire","Estado":"OK" if mlb else "Partial"},
+        {"Fuente":"MLB Lineup Team Guard","Uso":"M8: Team ID + exactly 9 hitters + official opponent roster verification","Estado":lineup_guard_status},
         {"Fuente":"Baseball Savant / Statcast","Uso":"Pitcher discipline, arsenal, movement, spin","Estado":"OK" if not sc_pitcher.empty else "ERROR"},
         {"Fuente":"Savant Team Page","Uso":"Opponent Contact, Chase, Zone, Whiff","Estado":opp_disc_source},
         {"Fuente":"Savant Pitch Arsenal","Uso":"Opponent vs pitch type","Estado":opp_pitch_source},
@@ -2718,4 +2822,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.1 LIVE VALIDATION · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.2 LIVE VALIDATION · Lineup Team Guard · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
