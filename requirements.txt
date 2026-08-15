@@ -4,3 +4,4 @@ pandas
 pybaseball>=2.2.7
 lxml
 beautifulsoup4
+openai>=1.0.0
