@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from pybaseball import (
     statcast,
     statcast_pitcher,
+    statcast_batter,
     statcast_batter_pitch_arsenal,
     pitching_stats,
     pitching_stats_bref,
@@ -21,7 +22,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.1.3 LIVE TEST
+# V3.1.4 LIVE TEST
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -637,6 +638,36 @@ def savant_team_pitch_type(team_id: int, season: int):
     out=pd.DataFrame(rows)
     return (out.sort_values("Pitches",ascending=False),"SAVANT_PITCH_ARSENAL") if not out.empty else (out,"EMPTY_AGG")
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def savant_expected_pitch_type_html(team_id: int, season: int):
+    """Second Savant path for xBA/xSLG/xwOBA when the CSV export omits them."""
+    frames=[]
+    for code in ("FF","SI","FC","SL","ST","CU","KC","CH","FS"):
+        url=("https://baseballsavant.mlb.com/leaderboard/pitch-arsenal-stats"
+             f"?type=batter&pitchType={code}&year={season}&team={team_id}&min=1")
+        try:
+            r=requests.get(url,headers={"User-Agent":"Mozilla/5.0"},timeout=TIMEOUT)
+            r.raise_for_status()
+            tables=pd.read_html(StringIO(r.text))
+        except Exception:
+            continue
+        for raw in tables:
+            t=_flatten_columns(raw)
+            cols=list(t.columns)
+            xba=_metric_col(cols,["xba","xBA"],["xba","expected batting average"])
+            xslg=_metric_col(cols,["xslg","xSLG"],["xslg","expected slugging"])
+            xw=_metric_col(cols,["xwoba","xwOBA"],["xwoba","expected weighted"])
+            pa=_metric_col(cols,["pa","PA"],["plate appearances"])
+            if not (xba and xslg and xw):
+                continue
+            w=pd.to_numeric(t[pa],errors="coerce").fillna(1) if pa else pd.Series(1,index=t.index,dtype=float)
+            def avg(c):
+                v=pd.to_numeric(t[c],errors="coerce"); good=v.notna() & (w>0)
+                return (v[good]*w[good]).sum()/w[good].sum() if good.any() else None
+            frames.append({"Pitch":PITCH_NAMES.get(code,code),"Code":code,"xBA":avg(xba),"xSLG":avg(xslg),"xwOBA":avg(xw)})
+            break
+    return pd.DataFrame(frames)
+
 # ============================================================
 # STATCAST ADVANCED METRICS
 # ============================================================
@@ -1088,6 +1119,14 @@ def mlb_people_info(player_ids):
 # LINEUP
 # ============================================================
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def hitter_statcast(pid:int,start_dt:str,end_dt:str):
+    try:
+        df=statcast_batter(start_dt,end_dt,int(pid))
+        return df if isinstance(df,pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
 def hitter_k_profile(pid,season,end_date,pitcher_hand):
     sit = "vl" if pitcher_hand.lower().startswith("left") else "vr"
     try:
@@ -1102,14 +1141,24 @@ def hitter_k_profile(pid,season,end_date,pitcher_hand):
         except Exception:
             stat = {}
     so,pa = safe_num(stat.get("strikeOuts")),safe_num(stat.get("plateAppearances"))
+    sc=hitter_statcast(pid,f"{season}-03-01",end_date)
+    disc=plate_discipline(sc) if not sc.empty else {}
     return {
         "K% vs hand": so/pa*100 if so is not None and pa else None,
-        "PA": pa, "Contact%": None, "Whiff%": None, "Source": source if stat else "N/A",
+        "PA": pa, "Contact%": disc.get("Contact%"), "Whiff%": disc.get("Whiff%"),
+        "Source": (source + " + Statcast") if stat and not sc.empty else (source if stat else ("Statcast" if not sc.empty else "N/A")),
     }
 
 
 def enrich_lineup(lineup,season,end_date,pitcher_hand):
-    return [{**r,**hitter_k_profile(r["player_id"],season,end_date,pitcher_hand)} for r in lineup]
+    people=mlb_people_info([r.get("player_id") for r in lineup])
+    out=[]
+    for r in lineup:
+        rr=dict(r); info=people.get(int(rr.get("player_id")),{}) if safe_num(rr.get("player_id")) is not None else {}
+        if str(rr.get("Bats") or "").upper() not in ("L","R","S"):
+            rr["Bats"]=info.get("Bats") or "N/A"
+        out.append({**rr,**hitter_k_profile(rr["player_id"],season,end_date,pitcher_hand)})
+    return out
 
 
 
@@ -1472,7 +1521,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.1.3 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
+      <div style="opacity:.70;margin-top:6px">V3.1.4 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -1644,6 +1693,20 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
                 after_missing = int(opp_pitch.isna().sum().sum())
                 if after_missing < before_missing:
                     opp_pitch_source = f"{opp_pitch_source} + RAW_STATCAST_FILL"
+    except Exception:
+        pass
+
+    # Savant HTML fallback: the public leaderboard displays xBA/xSLG/xwOBA even
+    # when its CSV route omits those columns. Only fill missing values.
+    try:
+        needed=(not opp_pitch.empty and any(c not in opp_pitch.columns or opp_pitch[c].isna().any() for c in ("xBA","xSLG","xwOBA")))
+        if needed:
+            exp=savant_expected_pitch_type_html(p["opponent_id"],game_date.year)
+            if not exp.empty:
+                before=int(opp_pitch[[c for c in ("xBA","xSLG","xwOBA") if c in opp_pitch.columns]].isna().sum().sum())
+                opp_pitch=merge_pitch_type_fallback(opp_pitch,exp)
+                after=int(opp_pitch[[c for c in ("xBA","xSLG","xwOBA") if c in opp_pitch.columns]].isna().sum().sum())
+                if after<before: opp_pitch_source=f"{opp_pitch_source} + SAVANT_HTML_EXPECTED"
     except Exception:
         pass
 
@@ -2083,4 +2146,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.1.3 LIVE TEST · Data-quality gate · expected-stat fallback · lineup handedness · cutoff-safe pregame model.")
+st.caption("V3.1.4 LIVE TEST · Data-quality gate · expected-stat fallback · lineup handedness · cutoff-safe pregame model.")
