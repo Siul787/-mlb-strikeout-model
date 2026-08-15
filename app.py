@@ -22,7 +22,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.1.6 LIVE TEST
+# V3.1.7 LIVE TEST
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -668,6 +668,122 @@ def savant_expected_pitch_type_html(team_id: int, season: int):
             break
     return pd.DataFrame(frames)
 
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def savant_pitch_type_detail_csv(team_id: int, season: int):
+    """
+    Robust Savant fallback for M5 expected stats.
+    Query each pitch family separately with csv=true, then aggregate the rows
+    returned for the selected opponent team. This route exposes xBA/xSLG/xwOBA
+    and RV/100 on Savant even when the all-pitches aggregate omits them.
+    """
+    pitch_codes=("FF","SI","FC","SL","ST","CU","KC","CH","FS","FO","SV","KN")
+    rows=[]
+
+    def metric_col(columns, names):
+        norm={c:normalize_name(c) for c in columns}
+        wanted=[normalize_name(x) for x in names]
+        # exact first
+        for c,n in norm.items():
+            if n in wanted:
+                return c
+        # then tolerant containment
+        for c,n in norm.items():
+            if any(w in n or n in w for w in wanted if w):
+                return c
+        return None
+
+    for pitch_code in pitch_codes:
+        url=(
+            "https://baseballsavant.mlb.com/leaderboard/pitch-arsenal-stats"
+            f"?type=batter&pitchType={pitch_code}&year={season}"
+            f"&team={team_id}&min=1&minPitches=1&csv=true"
+        )
+        try:
+            r=requests.get(
+                url,
+                headers={
+                    "User-Agent":"Mozilla/5.0",
+                    "Accept":"text/csv,text/plain,*/*",
+                    "Referer":"https://baseballsavant.mlb.com/",
+                },
+                timeout=TIMEOUT,
+            )
+            r.raise_for_status()
+            df=pd.read_csv(StringIO(r.text))
+        except Exception:
+            continue
+
+        if df.empty:
+            continue
+
+        df=_flatten_columns(df)
+        cols=list(df.columns)
+
+        pitches_col=metric_col(cols,["pitches","pitch_count","total pitches"])
+        pa_col=metric_col(cols,["pa","plate appearances","plate_appearances"])
+        rv_col=metric_col(cols,["run value","run_value","runs"])
+        rv100_col=metric_col(cols,["rv/100","rv100","run value / 100 pitches","run_value_per_100"])
+        ba_col=metric_col(cols,["ba","batting average"])
+        slg_col=metric_col(cols,["slg","slugging"])
+        woba_col=metric_col(cols,["woba"])
+        whiff_col=metric_col(cols,["whiff %","whiff%","whiff_percent","whiff rate"])
+        k_col=metric_col(cols,["k%","k_percent","strikeout %","strikeout rate"])
+        putaway_col=metric_col(cols,["put away %","putaway%","put_away_percent"])
+        xba_col=metric_col(cols,["xba","estimated ba","estimated_ba"])
+        xslg_col=metric_col(cols,["xslg","estimated slg","estimated_slg"])
+        xwoba_col=metric_col(cols,["xwoba","estimated woba","estimated_woba"])
+        hh_col=metric_col(cols,["hard hit %","hardhit%","hard_hit_percent"])
+
+        if pitches_col is None:
+            continue
+
+        wp=pd.to_numeric(df[pitches_col],errors="coerce").fillna(0)
+        wpa=pd.to_numeric(df[pa_col],errors="coerce").fillna(0) if pa_col else wp
+
+        def weighted(col, weights):
+            if col is None:
+                return None
+            vals=pd.to_numeric(df[col],errors="coerce")
+            good=vals.notna() & weights.notna() & (weights>0)
+            if not good.any():
+                return None
+            return float((vals[good]*weights[good]).sum()/weights[good].sum())
+
+        run_value=None
+        if rv_col:
+            vals=pd.to_numeric(df[rv_col],errors="coerce")
+            if vals.notna().any():
+                run_value=float(vals.sum())
+
+        rv100=weighted(rv100_col,wp)
+        total_pitches=float(wp.sum()) if wp.notna().any() else None
+        if rv100 is None and run_value is not None and total_pitches:
+            rv100=run_value/total_pitches*100
+
+        rows.append({
+            "Pitch":PITCH_NAMES.get(pitch_code,pitch_code),
+            "Code":pitch_code,
+            "Pitches":total_pitches,
+            "PA":float(wpa.sum()) if pa_col else None,
+            "BA":weighted(ba_col,wpa),
+            "SLG":weighted(slg_col,wpa),
+            "wOBA":weighted(woba_col,wpa),
+            "Whiff%":weighted(whiff_col,wp),
+            "K%":weighted(k_col,wpa),
+            "PutAway%":weighted(putaway_col,wp),
+            "xBA":weighted(xba_col,wpa),
+            "xSLG":weighted(xslg_col,wpa),
+            "xwOBA":weighted(xwoba_col,wpa),
+            "HardHit%":weighted(hh_col,wpa),
+            "RV100":rv100,
+            "Run Value":run_value,
+        })
+
+    out=pd.DataFrame(rows)
+    return out.sort_values("Pitches",ascending=False) if not out.empty else out
+
+
 # ============================================================
 # STATCAST ADVANCED METRICS
 # ============================================================
@@ -1057,10 +1173,45 @@ def savant_park_factors(year: int, rolling: int = 3):
 # These are used only when Savant's page cannot be parsed server-side.
 # 100 = neutral. Values are source-labelled in the UI instead of being invented.
 SAVANT_SO_VERIFIED_CACHE = {
+    # Baseball Savant 2024-2026 overall SO factors, verified Aug 2026.
+    # Sutter Health Park uses the current-year factor because a full 3Y
+    # sample is not yet available.
+    (2026,"coors field"):90.0,
+    (2026,"oriole park at camden yards"):99.0,
+    (2026,"chase field"):90.0,
+    (2026,"target field"):97.0,
+    (2026,"great american ball park"):103.0,
+    (2026,"nationals park"):94.0,
+    (2026,"fenway park"):98.0,
+    (2026,"citizens bank park"):104.0,
+    (2026,"uniqlo field at dodger stadium"):101.0,
+    (2026,"dodger stadium"):101.0,
+    (2026,"rogers centre"):98.0,
+    (2026,"rogers center"):98.0,
+    (2026,"kauffman stadium"):90.0,
+    (2026,"yankee stadium"):102.0,
+    (2026,"angel stadium"):105.0,
+    (2026,"loandepot park"):97.0,
     (2026,"comerica park"):99.0,
+    (2026,"pnc park"):99.0,
+    (2026,"daikin park"):107.0,
+    (2026,"minute maid park"):107.0,
+    (2026,"truist park"):104.0,
+    (2026,"citi field"):103.0,
+    (2026,"rate field"):97.0,
+    (2026,"guaranteed rate field"):97.0,
+    (2026,"progressive field"):104.0,
+    (2026,"petco park"):102.0,
+    (2026,"tropicana field"):102.0,
+    (2026,"busch stadium"):90.0,
+    (2026,"oracle park"):97.0,
+    (2026,"american family field"):110.0,
     (2026,"wrigley field"):102.0,
+    (2026,"globe life field"):101.0,
+    (2026,"t mobile park"):118.0,
+    (2026,"t-mobile park"):118.0,
+    (2026,"sutter health park"):91.0,
 }
-
 
 def park_so_factor(venue, year):
     target = normalize_name(venue)
@@ -1093,10 +1244,19 @@ def park_so_factor(venue, year):
                         label="Baseball Savant live · 3Y rolling" if rolling==3 else "Baseball Savant live · current year"
                         return x,label
 
-    cached = SAVANT_SO_VERIFIED_CACHE.get((year,target))
-    if cached is not None:
-        return cached, "Baseball Savant verified cache · 3Y rolling"
-    return None, "SOURCE RETRY NEEDED"
+    # Stable fallback: Park Factor is known before game time and must not
+    # remain blank just because Savant's HTML parser changes.
+    lookup_names=[target]
+    for alias_key,alias_values in aliases.items():
+        if target==alias_key or target in alias_values:
+            lookup_names.extend(alias_values)
+            lookup_names.append(alias_key)
+    for nm in lookup_names:
+        cached=SAVANT_SO_VERIFIED_CACHE.get((year,normalize_name(nm)))
+        if cached is not None:
+            period="current year" if normalize_name(nm)=="sutter health park" else "3Y rolling"
+            return cached, f"Baseball Savant verified cache · {period}"
+    return None, "PARK NOT MAPPED"
 
 
 # ============================================================
@@ -1587,7 +1747,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.1.6 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
+      <div style="opacity:.70;margin-top:6px">V3.1.7 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -1786,6 +1946,21 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
     except Exception:
         pass
 
+    # Final M5 fallback: query Savant's CSV one pitch family at a time.
+    # This is the route that explicitly exposes xBA/xSLG/xwOBA and RV/100.
+    try:
+        cov=pitch_expected_coverage(opp_pitch)
+        if not opp_pitch.empty and min(cov.values())==0:
+            detail=savant_pitch_type_detail_csv(p["opponent_id"],game_date.year)
+            if not detail.empty:
+                before_cov=pitch_expected_coverage(opp_pitch)
+                opp_pitch=merge_pitch_type_fallback(opp_pitch,detail)
+                after_cov=pitch_expected_coverage(opp_pitch)
+                if sum(after_cov.values())>sum(before_cov.values()):
+                    opp_pitch_source=f"{opp_pitch_source} + SAVANT_DETAIL_CSV"
+    except Exception:
+        pass
+
     park_so,park_source=park_so_factor(p["venue"],game_date.year)
 
     raw_lineup=confirmed_lineup(feed,p["opponent_side"])
@@ -1929,7 +2104,12 @@ with tab_modules:
         if not opp_pitch.empty:
             show_cols=[c for c in ["Pitch","Pitches","PA","BA","SLG","wOBA","Whiff%","K%","PutAway%","xBA","xSLG","xwOBA","HardHit%","RV100","Run Value"] if c in opp_pitch.columns]
             st.dataframe(clean_display_frame(opp_pitch[show_cols].round(3),"—"),hide_index=True,use_container_width=True)
-            st.caption(f"Fuente rival vs pitch type: {opp_pitch_source}. xBA/xSLG/xwOBA y RV100 se exigen antes de marcar M5 completo.")
+            cov=pitch_expected_coverage(opp_pitch)
+            st.caption(
+                f"Fuente rival vs pitch type: {opp_pitch_source} · "
+                f"Cobertura xBA {cov['xBA']} / xSLG {cov['xSLG']} / "
+                f"xwOBA {cov['xwOBA']} / RV100 {cov['RV100']} pitch types."
+            )
         else:
             st.error("ERROR DE FUENTE: Savant no devolvió el perfil rival por tipo de pitcheo.")
 
@@ -2088,11 +2268,12 @@ analysis_items=technical_analysis(
 def pitch_matchup_quality(df):
     if not isinstance(df,pd.DataFrame) or df.empty:return False
     required=["Whiff%","K%","xBA","xSLG","xwOBA","RV100"]
-    present=0
     for c in required:
-        if c in df.columns and pd.to_numeric(df[c],errors="coerce").notna().any():
-            present+=1
-    return present>=4
+        if c not in df.columns:
+            return False
+        if not pd.to_numeric(df[c],errors="coerce").notna().any():
+            return False
+    return True
 
 status={
     "M1":bool(mlb and not sc_pitcher.empty),
@@ -2222,4 +2403,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.1.6 LIVE TEST · Savant SO Park Factor 3Y fallback · data-quality gate · cutoff-safe pregame model.")
+st.caption("V3.1.7 LIVE TEST · Savant detail CSV expected stats · full park-factor fallback · cutoff-safe pregame model.")
