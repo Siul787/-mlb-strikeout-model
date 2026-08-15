@@ -21,7 +21,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.1 LIVE TEST
+# V3.1.1 LIVE TEST
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -150,7 +150,7 @@ st.markdown(
     .board-legend{font-size:.70rem;opacity:.55;margin-top:-8px;margin-bottom:12px}
     @media (max-width:1100px){.board-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
     @media (max-width:760px){
-      .board-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+      .board-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
       .board-game{padding:7px;min-height:158px;border-radius:11px}
       .board-logo{width:21px;height:21px}
       .board-team{grid-template-columns:22px 1fr auto;gap:4px}
@@ -1394,7 +1394,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.1 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
+      <div style="opacity:.70;margin-top:6px">V3.1.1 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -1464,27 +1464,27 @@ if st.session_state["view_mode"]=="slate":
             parts=opt["pitcher_name"].split()
             return (parts[0][0]+". "+parts[-1]) if len(parts)>1 else opt["pitcher_name"]
 
-        cards.append(f"""
-        <div class="board-game">
-          <div class="board-time">{first.get('game_time','TBD')} · {first.get('venue','')}</div>
-          <div class="board-team">
-            <img class="board-logo" src="{away_logo}">
-            <div><div class="board-abbr">{abbr(away['team'])}</div><div class="board-pitcher">{pshort(away)} ({away['throwing_hand'][:1]})</div></div>
-            <div class="board-k">{fmt(away_snap.get('K%'),1,'%')}</div>
-          </div>
-          <div class="board-team">
-            <img class="board-logo" src="{home_logo}">
-            <div><div class="board-abbr">{abbr(home['team'])}</div><div class="board-pitcher">{pshort(home)} ({home['throwing_hand'][:1]})</div></div>
-            <div class="board-k">{fmt(home_snap.get('K%'),1,'%')}</div>
-          </div>
-          <div class="board-actions">
-            <a class="board-link" href="?pitcher={away['selection_id']}">ANALIZAR {abbr(away['team'])}</a>
-            <a class="board-link" href="?pitcher={home['selection_id']}">ANALIZAR {abbr(home['team'])}</a>
-          </div>
-        </div>
-        """)
+        cards.append(
+            f'<div class="board-game">'
+            f'<div class="board-time">{first.get("game_time","TBD")} · {first.get("venue","")}</div>'
+            f'<div class="board-team">'
+            f'<img class="board-logo" src="{away_logo}">'
+            f'<div><div class="board-abbr">{abbr(away["team"])}</div><div class="board-pitcher">{pshort(away)} ({away["throwing_hand"][:1]})</div></div>'
+            f'<div class="board-k">{fmt(away_snap.get("K%"),1,"%")}</div>'
+            f'</div>'
+            f'<div class="board-team">'
+            f'<img class="board-logo" src="{home_logo}">'
+            f'<div><div class="board-abbr">{abbr(home["team"])}</div><div class="board-pitcher">{pshort(home)} ({home["throwing_hand"][:1]})</div></div>'
+            f'<div class="board-k">{fmt(home_snap.get("K%"),1,"%")}</div>'
+            f'</div>'
+            f'<div class="board-actions">'
+            f'<a class="board-link" href="?pitcher={away["selection_id"]}">ANALIZAR {abbr(away["team"])}</a>'
+            f'<a class="board-link" href="?pitcher={home["selection_id"]}">ANALIZAR {abbr(home["team"])}</a>'
+            f'</div></div>'
+        )
 
-    st.markdown('<div class="board-grid">'+"".join(cards)+'</div>',unsafe_allow_html=True)
+    board_html='<div class="board-grid">'+''.join(cards)+'</div>'
+    st.markdown(board_html,unsafe_allow_html=True)
     st.markdown('<div class="board-legend">K% rápido = perfil base pregame. El board NO emite apuestas; abre un pitcher para M1–M9.</div>',unsafe_allow_html=True)
     st.stop()
 
@@ -1994,4 +1994,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.1 LIVE TEST · Compact Daily Board · multi-source fallback · cutoff-safe pregame model.")
+st.caption("V3.1.1 LIVE TEST · Compact Daily Board · multi-source fallback · cutoff-safe pregame model.")
