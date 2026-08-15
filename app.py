@@ -20,7 +20,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V2.0 LIVE TEST
+# V2.2 LIVE TEST
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -52,7 +52,7 @@ CALLED_STRIKE_DESCRIPTIONS = {"called_strike"}
 
 st.set_page_config(
     page_title="MLB Starting Pitcher K Model",
-    page_icon="â¾",
+    page_icon="\\u26be",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -130,7 +130,7 @@ def safe_num(v):
 
 def fmt(v, decimals=1, suffix=""):
     x = safe_num(v)
-    return "N/A" if x is None else f"{x:.{decimals}f}{suffix}"
+    return "DATA ERROR" if x is None else f"{x:.{decimals}f}{suffix}"
 
 
 def clamp(x, lo, hi):
@@ -338,7 +338,7 @@ def game_time_label(raw):
         return "TBD"
     try:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return dt.astimezone(timezone.utc).strftime("%b %d Â· %I:%M %p UTC").replace(" 0", " ")
+        return dt.astimezone(timezone.utc).strftime("%b %d \\u00b7 %I:%M %p UTC").replace(" 0", " ")
     except Exception:
         return "TBD"
 
@@ -427,6 +427,35 @@ def confirmed_lineup(feed, side):
     return rows
 
 
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def mlb_team_ids(season: int):
+    try:
+        d = get_json(MLB_TEAMS_URL, params={"sportId": 1, "season": season})
+        return [int(t["id"]) for t in d.get("teams", []) if t.get("id")]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def league_hitting_average_to_date(season: int, end_date: str):
+    total_so = total_bb = total_pa = 0.0
+    for tid in mlb_team_ids(season):
+        try:
+            s = team_hitting_to_date(tid, season, end_date)
+        except Exception:
+            continue
+        so = safe_num(s.get("strikeOuts"))
+        bb = safe_num(s.get("baseOnBalls"))
+        pa = safe_num(s.get("plateAppearances"))
+        if pa:
+            total_so += so or 0.0
+            total_bb += bb or 0.0
+            total_pa += pa
+    if not total_pa:
+        return {}
+    return {"K%": total_so/total_pa*100, "BB%": total_bb/total_pa*100, "PA": total_pa}
+
 # ============================================================
 # STATCAST ADVANCED METRICS
 # ============================================================
@@ -442,11 +471,27 @@ def pitcher_statcast(player_id: int, start_dt: str, end_dt: str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def team_statcast(team_abbr: str, start_dt: str, end_dt: str):
+    """Baseball Savant team Statcast with a recent-window fallback."""
     try:
         df = statcast(start_dt, end_dt, team=team_abbr, verbose=False, parallel=True)
-        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df, "SEASON"
     except Exception:
-        return pd.DataFrame()
+        pass
+
+    try:
+        end = pd.Timestamp(end_dt).date()
+        recent_start = max(pd.Timestamp(start_dt).date(), end - timedelta(days=45))
+        df = statcast(
+            recent_start.isoformat(), end_dt,
+            team=team_abbr, verbose=False, parallel=True
+        )
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df, "RECENT_45D_FALLBACK"
+    except Exception:
+        pass
+
+    return pd.DataFrame(), "SOURCE_ERROR"
 
 
 def offensive_team_rows(df: pd.DataFrame, team_abbr: str):
@@ -612,6 +657,12 @@ def opponent_pitch_type_table(team_offense: pd.DataFrame):
         drv = pd.to_numeric(g["delta_run_exp"],errors="coerce").sum() if "delta_run_exp" in g.columns else None
         rv100 = drv/len(g)*100 if drv is not None and len(g) else None
 
+        strikes = pd.to_numeric(g["strikes"], errors="coerce") if "strikes" in g.columns else pd.Series(index=g.index,dtype=float)
+        two_strike = strikes.eq(2)
+        k_event = g["events"].astype(str).str.contains("strikeout",case=False,na=False) if "events" in g.columns else pd.Series(False,index=g.index)
+        putaway = (two_strike & k_event).sum()/two_strike.sum()*100 if two_strike.sum() else None
+        iso = pd.to_numeric(g["iso_value"], errors="coerce").mean() if "iso_value" in g.columns else None
+
         rows.append({
             "Pitch": PITCH_NAMES.get(str(pitch),str(pitch)),
             "Code": str(pitch),
@@ -622,9 +673,9 @@ def opponent_pitch_type_table(team_offense: pd.DataFrame):
             "wOBA": woba,
             "Whiff%": disc["Whiff%"],
             "K%": pa_rates_row["K%"],
-            "PutAway%": None,
+            "PutAway%": putaway,
             "xBA": xba,
-            "xSLG": None,
+            "ISO": iso,
             "xwOBA": xwoba,
             "HardHit%": hardhit,
             "RV100": rv100,
@@ -681,20 +732,49 @@ def statcast_recent_games(df: pd.DataFrame, n=10):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def savant_park_factors(year: int):
-    params = {"type":"year","year":year,"condition":"All","parks":"mlb","rolling":3}
-    try:
-        r = requests.get(SAVANT_PARK_URL,params=params,headers={"User-Agent":"Mozilla/5.0"},timeout=TIMEOUT)
-        r.raise_for_status()
-        tables = pd.read_html(StringIO(r.text))
+    headers = {"User-Agent": "Mozilla/5.0"}
+    variants = [
+        {"type":"year","year":year,"condition":"All","parks":"mlb","rolling":3,"stat":"index_SO"},
+        {"type":"venue","year":max(year-2,2015),"condition":"All","parks":"mlb","rolling":3,"stat":"index_SO"},
+        {"type":"year","year":year,"condition":"All","parks":"mlb","rolling":3,"stat":"index_wOBA"},
+    ]
+    for params in variants:
+        try:
+            r = requests.get(SAVANT_PARK_URL, params=params, headers=headers, timeout=TIMEOUT)
+            r.raise_for_status()
+            tables = pd.read_html(StringIO(r.text))
+        except Exception:
+            continue
         for t in tables:
-            if isinstance(t.columns,pd.MultiIndex):
-                t.columns = [str(c[-1]).strip() for c in t.columns]
+            if isinstance(t.columns, pd.MultiIndex):
+                t.columns = [
+                    next((str(x).strip() for x in reversed(col) if str(x).strip() and str(x) != "nan"), "")
+                    for col in t.columns
+                ]
             else:
                 t.columns = [str(c).strip() for c in t.columns]
-            if "Venue" in t.columns and "SO" in t.columns:
-                return t
-    except Exception:
-        pass
+            venue_col = next((c for c in t.columns if normalize_name(c) == "venue"), None)
+            if not venue_col:
+                continue
+            so_col = next((c for c in t.columns if normalize_name(c) in ("so","strikeouts")), None)
+            if so_col:
+                out = t[[venue_col,so_col]].copy()
+                out.columns = ["Venue","SO"]
+                return out
+            if params.get("stat") == "index_SO":
+                candidates = []
+                for c in t.columns:
+                    if c == venue_col:
+                        continue
+                    vals = pd.to_numeric(t[c], errors="coerce")
+                    if vals.notna().sum() >= 10 and not vals.dropna().empty:
+                        med = vals.dropna().median()
+                        if 70 <= med <= 130:
+                            candidates.append(c)
+                if candidates:
+                    out = t[[venue_col,candidates[0]]].copy()
+                    out.columns = ["Venue","SO"]
+                    return out
     return pd.DataFrame()
 
 
@@ -803,8 +883,25 @@ def hitter_k_profile(pid,season,end_date,pitcher_hand):
     }
 
 
-def enrich_lineup(lineup,season,end_date,pitcher_hand):
-    return [{**r,**hitter_k_profile(r["player_id"],season,end_date,pitcher_hand)} for r in lineup]
+def enrich_lineup(lineup, season, end_date, pitcher_hand, opponent_offense=None):
+    enriched = []
+    for r in lineup:
+        row = {**r, **hitter_k_profile(r["player_id"], season, end_date, pitcher_hand)}
+        if isinstance(opponent_offense, pd.DataFrame) and not opponent_offense.empty and "batter" in opponent_offense.columns:
+            ids = pd.to_numeric(opponent_offense["batter"], errors="coerce")
+            sub = opponent_offense[ids.eq(int(r["player_id"]))].copy()
+            if not sub.empty and "p_throws" in sub.columns:
+                wanted = "L" if pitcher_hand.lower().startswith("left") else "R"
+                h = sub[sub["p_throws"].astype(str).eq(wanted)]
+                if not h.empty:
+                    sub = h
+            disc = plate_discipline(sub)
+            if disc.get("Contact%") is not None:
+                row["Contact%"] = disc["Contact%"]
+            if disc.get("Whiff%") is not None:
+                row["Whiff%"] = disc["Whiff%"]
+        enriched.append(row)
+    return enriched
 
 
 def lineup_k_pct(lineup):
@@ -962,51 +1059,51 @@ def technical_analysis(mlb,pdisc,split_l,split_r,opp_disc,team_general,team_spli
     csw = safe_num(pdisc.get("CSW%"))
     contact = safe_num(pdisc.get("Contact%"))
     m1 = direction(k_pct,22.5,False,1.5)
-    items.append(("M1 Â· Capacidad",m1,
+    items.append(("M1 \\u00b7 Capacidad",m1,
         f"K% {fmt(k_pct,1,'%')}, Whiff% {fmt(whiff,1,'%')}, CSW% {fmt(csw,1,'%')} y Contact% {fmt(contact,1,'%')}. "
-        "La combinaciÃ³n mide dominio real: ponches, swings fallidos y capacidad de evitar contacto."))
+        "La combinaci\\u00f3n mide dominio real: ponches, swings fallidos y capacidad de evitar contacto."))
 
     m2 = "POSITIVO" if safe_num(recent.get("avg_pitches")) and recent["avg_pitches"]>=90 else "NEUTRAL"
     if manual.get("pitch_limit") or manual.get("injury_return") or manual.get("opener"):
         m2 = "NEGATIVO"
-    items.append(("M2 Â· Volumen / Leash",m2,
+    items.append(("M2 \\u00b7 Volumen / Leash",m2,
         f"BF proyectados {fmt(proj['bf'],1)}, pitches L10 {fmt(recent.get('avg_pitches'),1)}, "
         f"90+ {fmt(recent.get('freq_90'),0,'%')}, 100+ {fmt(recent.get('freq_100'),0,'%')}. "
-        "El techo de K depende de cuÃ¡ntos bateadores realmente puede enfrentar."))
+        "El techo de K depende de cu\\u00e1ntos bateadores realmente puede enfrentar."))
 
     l = safe_num(split_l.get("K%")); r = safe_num(split_r.get("K%"))
     m3 = "NEUTRAL"
     if l is not None and r is not None and abs(l-r)>=5: m3="MATCHUP-DEPENDENT"
-    items.append(("M3 Â· Splits",m3,
+    items.append(("M3 \\u00b7 Splits",m3,
         f"K% vs LHB {fmt(l,1,'%')} y vs RHB {fmt(r,1,'%')}. "
-        "Una diferencia grande hace que la composiciÃ³n L/R/S del lineup tenga mÃ¡s importancia."))
+        "Una diferencia grande hace que la composici\\u00f3n L/R/S del lineup tenga m\\u00e1s importancia."))
 
     ok = safe_num(team_split.get("calc_k_pct")) or safe_num(team_general.get("calc_k_pct"))
     m4 = direction(ok,22.5,False,1.5)
-    items.append(("M4 Â· Rival",m4,
+    items.append(("M4 \\u00b7 Rival",m4,
         f"Opponent K% vs hand {fmt(ok,1,'%')}; Whiff% {fmt(opp_disc.get('Whiff%'),1,'%')}; "
-        f"Contact% {fmt(opp_disc.get('Contact%'),1,'%')}. Un rival con mÃ¡s K y menos contacto eleva oportunidades."))
+        f"Contact% {fmt(opp_disc.get('Contact%'),1,'%')}. Un rival con m\\u00e1s K y menos contacto eleva oportunidades."))
 
     top_pitch = arsenal.iloc[0]["Pitch"] if isinstance(arsenal,pd.DataFrame) and not arsenal.empty else "N/A"
     top_whiff = arsenal.iloc[0]["Whiff%"] if isinstance(arsenal,pd.DataFrame) and not arsenal.empty else None
     m5 = "POSITIVO" if safe_num(top_whiff) and safe_num(top_whiff)>=25 else "NEUTRAL"
-    items.append(("M5 Â· Arsenal",m5,
+    items.append(("M5 \\u00b7 Arsenal",m5,
         f"Lanzamiento principal: {top_pitch}, Whiff% {fmt(top_whiff,1,'%')}. "
-        "El mÃ³dulo compara las armas de mayor uso con cÃ³mo responde la ofensiva a esos tipos de pitcheo."))
+        "El m\\u00f3dulo compara las armas de mayor uso con c\\u00f3mo responde la ofensiva a esos tipos de pitcheo."))
 
     m6 = "POSITIVO" if safe_num(recent.get("avg_k")) and safe_num(mlb.get("calc_k_start")) and recent["avg_k"]>mlb["calc_k_start"]+.5 else "NEUTRAL"
-    items.append(("M6 Â· Forma reciente",m6,
+    items.append(("M6 \\u00b7 Forma reciente",m6,
         f"K L10 {fmt(recent.get('avg_k'),1)} vs K/start temporada {fmt(mlb.get('calc_k_start'),1)}. "
         "Velocidad, spin, movimiento, uso y disciplina recientes sirven para detectar cambios reales."))
 
     m7 = "POSITIVO" if safe_num(park_so) and park_so>101 else ("NEGATIVO" if safe_num(park_so) and park_so<99 else "NEUTRAL")
-    items.append(("M7 Â· Contexto",m7,
-        f"SO Park Factor {fmt(park_so,0)} (100 neutral). Clima y umpire se muestran, pero mantienen peso bajo hasta validaciÃ³n."))
+    items.append(("M7 \\u00b7 Contexto",m7,
+        f"SO Park Factor {fmt(park_so,0)} (100 neutral). Clima y umpire se muestran, pero mantienen peso bajo hasta validaci\\u00f3n."))
 
     lk = lineup_k_pct(lineup)
     m8 = direction(lk,22.5,False,1.5) if lineup else "PENDIENTE"
-    items.append(("M8 Â· Lineup",m8,
-        f"Lineup K% agregado {fmt(lk,1,'%')}. El anÃ¡lisis definitivo mejora cuando los 9 bateadores confirmados estÃ¡n disponibles."))
+    items.append(("M8 \\u00b7 Lineup",m8,
+        f"Lineup K% agregado {fmt(lk,1,'%')}. El an\\u00e1lisis definitivo mejora cuando los 9 bateadores confirmados est\\u00e1n disponibles."))
 
     return items
 
@@ -1020,7 +1117,7 @@ st.markdown(
     <div class="hero">
       <div style="font-size:.78rem;opacity:.68">MODELO PROFESIONAL MLB</div>
       <div style="font-size:2rem;font-weight:850">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.72;margin-top:5px">V2.0 LIVE TEST Â· Pregame-only data Â· Multi-line EV Â· Technical Analysis</div>
+      <div style="opacity:.72;margin-top:5px">V2.2 LIVE TEST \\u00b7 Pregame-only data \\u00b7 Multi-line EV \\u00b7 Technical Analysis</div>
     </div>
     """,unsafe_allow_html=True,
 )
@@ -1043,7 +1140,7 @@ by_id={x["selection_id"]:x for x in options}
 with c2:
     selected=st.selectbox(
         "Abridor",list(by_id),
-        format_func=lambda x:f"{by_id[x]['pitcher_name']} Â· {by_id[x]['team']} vs {by_id[x]['opponent']}"
+        format_func=lambda x:f"{by_id[x]['pitcher_name']} \\u00b7 {by_id[x]['team']} vs {by_id[x]['opponent']}"
     )
 p=by_id[selected]
 
@@ -1092,15 +1189,19 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
     except Exception:
         opp_abbr=""
 
-    opp_sc_all=team_statcast(opp_abbr,sc_start,cutoff_str) if opp_abbr else pd.DataFrame()
+    if opp_abbr:
+        opp_sc_all, opp_statcast_source = team_statcast(opp_abbr,sc_start,cutoff_str)
+    else:
+        opp_sc_all, opp_statcast_source = pd.DataFrame(), "NO_TEAM_ABBR"
     opp_off=offensive_team_rows(opp_sc_all,opp_abbr) if opp_abbr else pd.DataFrame()
     opp_disc=plate_discipline(opp_off)
     opp_pitch=opponent_pitch_type_table(opp_off)
+    league_avg=league_hitting_average_to_date(game_date.year,cutoff_str)
 
     park_so,park_source=park_so_factor(p["venue"],game_date.year)
 
     raw_lineup=confirmed_lineup(feed,p["opponent_side"])
-    lineup=enrich_lineup(raw_lineup,game_date.year,cutoff_str,p["throwing_hand"]) if raw_lineup else []
+    lineup=enrich_lineup(raw_lineup,game_date.year,cutoff_str,p["throwing_hand"],opp_off) if raw_lineup else []
 
     recent=recent_summary(log)
     rest_days=days_rest(log,game_date)
@@ -1118,7 +1219,7 @@ proj=build_projection(mlb,pdisc,team_general,team_split,lineup,recent,park_so)
 # ============================================================
 
 tab_summary,tab_modules,tab_analysis,tab_market,tab_sources=st.tabs(
-    ["Resumen","MÃ³dulos 1â8","AnÃ¡lisis TÃ©cnico","Mercado / Edge","Fuentes"]
+    ["Resumen","M\\u00f3dulos 1\\u20138","An\\u00e1lisis T\\u00e9cnico","Mercado / Edge","Fuentes"]
 )
 
 # ------------------------------------------------------------
@@ -1129,25 +1230,25 @@ with tab_summary:
     a.metric("BF proyectados",fmt(proj["bf"],1))
     b.metric("K% proyectado",fmt(proj["k_pct"],1,"%"))
     c.metric("Strikeouts proyectados",fmt(proj["central"],2))
-    d.metric("Rango probable",f"{proj['low']:.1f}â{proj['high']:.1f}")
+    d.metric("Rango probable",f"{proj['low']:.1f}\\u2013{proj['high']:.1f}")
 
     st.subheader("Probabilidad por umbral")
     dist=[]
     for k in range(3,11):
         prob=poisson_ge(k,proj["central"])
-        dist.append({"LÃ­nea":f"{k}+","Probabilidad":prob*100,"Fair Odds":fair_american(prob)})
+        dist.append({"L\\u00ednea":f"{k}+","Probabilidad":prob*100,"Fair Odds":fair_american(prob)})
     dist_df=pd.DataFrame(dist)
     dist_df["Probabilidad"]=dist_df["Probabilidad"].round(1)
     dist_df["Fair Odds"]=dist_df["Fair Odds"].round(0)
     st.dataframe(dist_df,hide_index=True,use_container_width=True)
 
-    st.info("Esta es la proyecciÃ³n estadÃ­stica pregame. La selecciÃ³n de apuesta ocurre solamente despuÃ©s de comparar TODAS las lÃ­neas y precios disponibles.")
+    st.info("Esta es la proyecci\\u00f3n estad\\u00edstica pregame. La selecci\\u00f3n de apuesta ocurre solamente despu\\u00e9s de comparar TODAS las l\\u00edneas y precios disponibles.")
 
 # ------------------------------------------------------------
 # MODULES 1-8
 # ------------------------------------------------------------
 with tab_modules:
-    with st.expander("M1 Â· Capacidad real de strikeout â 20%",expanded=True):
+    with st.expander("M1 \\u00b7 Capacidad real de strikeout \\u2014 20%",expanded=True):
         a,b,c,d=st.columns(4)
         a.metric("K%",fmt(mlb.get("calc_k_pct"),1,"%"))
         a.metric("K/9",mlb.get("strikeoutsPer9Inn","N/A"))
@@ -1170,7 +1271,7 @@ with tab_modules:
         ))
         d.metric("Sample pitches",fmt(pdisc.get("Pitches"),0))
 
-    with st.expander("M2 Â· Volumen / Leash â 20%"):
+    with st.expander("M2 \\u00b7 Volumen / Leash \\u2014 20%"):
         a,b,c,d=st.columns(4)
         a.metric("IP/start",fmt(mlb.get("calc_ip_start"),2))
         a.metric("BF/start",fmt(mlb.get("calc_bf_start"),1))
@@ -1190,16 +1291,16 @@ with tab_modules:
         st.markdown("**Manual / news context**")
         m21,m22,m23=st.columns(3)
         with m21:
-            injury_return=st.checkbox("Regreso de lesiÃ³n")
+            injury_return=st.checkbox("Regreso de lesi\\u00f3n")
             pitch_limit=st.checkbox("Posible pitch limit")
         with m22:
             opener=st.checkbox("Opener / bulk pitcher")
             manager_quick_hook=st.checkbox("Manager con hook corto esperado")
         with m23:
             manual_pitch_limit=st.number_input("Pitch limit estimado (0 = desconocido)",0,130,0,5)
-        leash_notes=st.text_area("Notas de leash / manager / lesiÃ³n",key="leash_notes")
+        leash_notes=st.text_area("Notas de leash / manager / lesi\\u00f3n",key="leash_notes")
 
-    with st.expander("M3 Â· Splits del pitcher â 10%"):
+    with st.expander("M3 \\u00b7 Splits del pitcher \\u2014 10%"):
         split_df=pd.DataFrame([
             {"Split":"vs RHB",**{k:split_r.get(k) for k in ("PA","K%","BB%","K-BB%","Whiff%","Contact%")}},
             {"Split":"vs LHB",**{k:split_l.get(k) for k in ("PA","K%","BB%","K-BB%","Whiff%","Contact%")}},
@@ -1207,11 +1308,11 @@ with tab_modules:
         st.dataframe(split_df,hide_index=True,use_container_width=True)
         if lineup:
             counts=pd.Series([r.get("Bats","N/A") for r in lineup]).value_counts().to_dict()
-            st.write(f"**Lineup esperado/confirmado:** L {counts.get('L',0)} Â· R {counts.get('R',0)} Â· S {counts.get('S',0)}")
+            st.write(f"**Lineup esperado/confirmado:** L {counts.get('L',0)} \\u00b7 R {counts.get('R',0)} \\u00b7 S {counts.get('S',0)}")
         else:
-            st.info("ComposiciÃ³n final pendiente hasta que MLB publique lineup.")
+            st.info("Composici\\u00f3n final pendiente hasta que MLB publique lineup.")
 
-    with st.expander("M4 Â· Rival / propensiÃ³n a strikeout â 20%"):
+    with st.expander("M4 \\u00b7 Rival / propensi\\u00f3n a strikeout \\u2014 20%"):
         a,b,c,d=st.columns(4)
         a.metric("Team K%",fmt(team_general.get("calc_k_pct"),1,"%"))
         a.metric("K% vs hand",fmt(team_split.get("calc_k_pct"),1,"%"))
@@ -1224,10 +1325,13 @@ with tab_modules:
         c.metric("Chase%",fmt(opp_disc.get("Chase%"),1,"%"))
         d.metric("Swing%",fmt(opp_disc.get("Swing%"),1,"%"))
         d.metric("Zone%",fmt(opp_disc.get("Zone%"),1,"%"))
-        d.metric("MLB Avg comparison","N/A")
-        st.caption("MLB-average comparison remains visible but N/A until a reliable current-season league plate-discipline feed is validated.")
+        league_k=safe_num(league_avg.get("K%"))
+        opp_k_cmp=safe_num(team_split.get("calc_k_pct")) or safe_num(team_general.get("calc_k_pct"))
+        delta_mlb=opp_k_cmp-league_k if opp_k_cmp is not None and league_k is not None else None
+        d.metric("K% vs MLB Avg",fmt(delta_mlb,1," pp"))
+        st.caption(f"Opponent Statcast: {opp_statcast_source} \\u00b7 MLB K% through cutoff: {fmt(league_k,1,'%')}")
 
-    with st.expander("M5 Â· Arsenal vs Matchup â 15%"):
+    with st.expander("M5 \\u00b7 Arsenal vs Matchup \\u2014 15%"):
         st.markdown("**Pitcher arsenal**")
         if not arsenal.empty:
             view=arsenal[["Pitch","Pitches","Usage%","Velo","Spin","Whiff%","K%","PutAway%","xwOBA","Run Value"]].copy()
@@ -1238,33 +1342,33 @@ with tab_modules:
         st.markdown("**Rival vs pitch type**")
         if not opp_pitch.empty:
             st.dataframe(
-                opp_pitch[["Pitch","Pitches","PA","BA","SLG","wOBA","Whiff%","K%","PutAway%","xBA","xSLG","xwOBA","HardHit%","RV100"]].round(3),
+                opp_pitch[["Pitch","Pitches","PA","BA","SLG","wOBA","Whiff%","K%","PutAway%","xBA","ISO","xwOBA","HardHit%","RV100"]].round(3),
                 hide_index=True,use_container_width=True
             )
-            st.caption("xSLG and opponent PutAway are displayed as N/A when Statcast does not provide a defensible direct calculation.")
+            st.caption("Savant has no direct pitch-level xSLG field, so ISO is shown instead of inventing xSLG. PutAway% is calculated from two-strike pitches.")
         else:
             st.info("No se pudo construir el perfil de la ofensiva por tipo de pitcheo.")
 
-    with st.expander("M6 Â· Forma y cambios recientes â 5%"):
+    with st.expander("M6 \\u00b7 Forma y cambios recientes \\u2014 5%"):
         if not recent_sc.empty:
             st.dataframe(recent_sc.round(2),hide_index=True,use_container_width=True)
         else:
             st.info("No recent Statcast trend table.")
         st.caption("Incluye K%, K-BB%, Whiff%, CSW%, Ball%, velocidad, spin, movimiento y cambios de uso. xFIP/SIERA permanecen como cross-check de FanGraphs cuando la fuente responde.")
 
-    with st.expander("M7 Â· Contexto â 5%"):
+    with st.expander("M7 \\u00b7 Contexto \\u2014 5%"):
         a,b,c,d=st.columns(4)
         a.metric("Local / Visitante","Home" if p["team_side"]=="home" else "Away")
         a.metric("Stadium",p["venue"])
         b.metric("SO Park Factor",fmt(park_so,0))
         b.caption(park_source)
-        c.metric("Temperature",f"{context['temperature']}Â°F" if context.get("temperature") is not None else "N/A")
-        c.metric("Wind",context.get("wind") or "N/A")
-        d.metric("Umpire",context.get("umpire") or "N/A")
-        d.metric("Umpire K tendency","N/A")
+        c.metric("Temperature",f"{context['temperature']}\\u00b0F" if context.get("temperature") is not None else "PENDIENTE")
+        c.metric("Wind",context.get("wind") or "PENDIENTE")
+        d.metric("Umpire",context.get("umpire") or "PENDIENTE")
+        d.metric("Umpire K tendency","PENDIENTE" if not context.get("umpire") else "POR VALIDAR")
         st.caption("Weather and umpire stay low-weight until validation supports stronger use.")
 
-    with st.expander("M8 Â· Lineup confirmado â 5%"):
+    with st.expander("M8 \\u00b7 Lineup confirmado \\u2014 5%"):
         if lineup:
             ldf=pd.DataFrame(lineup)
             st.dataframe(ldf[["#","Hitter","Bats","K% vs hand","PA","Contact%","Whiff%","Source"]],hide_index=True,use_container_width=True)
@@ -1273,15 +1377,16 @@ with tab_modules:
             st.write("**High-K hitters:** "+(", ".join(high) if high else "None flagged"))
             st.write("**Low-K hitters:** "+(", ".join(low) if low else "None flagged"))
         else:
-            st.warning("NO cerrar anÃ¡lisis definitivo: lineup real todavÃ­a no estÃ¡ confirmado.")
+            st.warning("PENDIENTE: lineup real todav\\u00eda no est\\u00e1 confirmado. No se cierra el an\\u00e1lisis definitivo.")
         lineup_notes=st.text_area("Ausencias / sustituciones / diferencias vs lineup habitual",key="lineup_notes")
 
 # ------------------------------------------------------------
 # MARKET / ALL LINES
 # ------------------------------------------------------------
 with tab_market:
-    st.subheader("M9 Â· TODAS las lÃ­neas disponibles")
-    st.caption("AÃ±ade solamente las lÃ­neas reales que tengas en DraftKings y FanDuel. El modelo evalÃºa cada precio y NO fuerza la lÃ­nea principal.")
+    st.subheader("M9 \\u00b7 TODAS las l\\u00edneas disponibles")
+    st.caption("Motor verificado: Over X.5 = P(K\\u2265siguiente entero); Under X.5 = P(K\\u2264entero inferior); Alt N+ = P(K\\u2265N).")
+    st.caption("A\\u00f1ade solamente las l\\u00edneas reales que tengas en DraftKings y FanDuel. El modelo eval\\u00faa cada precio y NO fuerza la l\\u00ednea principal.")
 
     default_market=pd.DataFrame([
         {"Sportsbook":"DraftKings","Market":"Over","Line":4.5,"Odds":-110},
@@ -1382,11 +1487,11 @@ status={
     "M1":bool(mlb and not sc_pitcher.empty),
     "M2":bool(mlb and log),
     "M3":bool(not sc_pitcher.empty),
-    "M4":bool(team_general),
-    "M5":bool(not arsenal.empty),
+    "M4":bool(team_general and not opp_off.empty),
+    "M5":bool(not arsenal.empty and not opp_pitch.empty),
     "M6":bool(not recent_sc.empty),
     "M7":bool(park_so is not None),
-    "M8":bool(lineup),
+    "M8":bool(len(lineup) >= 9),
     "M9":bool('market_df' in locals() and not market_df.empty),
 }
 modules=sum(status.values())
@@ -1398,10 +1503,10 @@ if 'market_df' in locals() and not market_df.empty:
         best=eligible.sort_values("EV%",ascending=False).iloc[0].to_dict()
 
 with tab_analysis:
-    st.subheader("QuÃ© nos dicen los datos")
+    st.subheader("Qu\\u00e9 nos dicen los datos")
     for title,signal,text in analysis_items:
         st.markdown(
-            f"""<div class="analysis-card"><b>{title}</b> Â· <b>{signal}</b><br><span style="opacity:.78">{text}</span></div>""",
+            f"""<div class="analysis-card"><b>{title}</b> \\u00b7 <b>{signal}</b><br><span style="opacity:.78">{text}</span></div>""",
             unsafe_allow_html=True,
         )
 
@@ -1410,21 +1515,21 @@ with tab_analysis:
     negatives=[title for title,signal,_ in analysis_items if signal=="NEGATIVO"]
     x1,x2=st.columns(2)
     with x1:
-        st.success("**A favor:** "+(", ".join(positives) if positives else "No hay seÃ±ales fuertes aisladas."))
+        st.success("**A favor:** "+(", ".join(positives) if positives else "No hay se\\u00f1ales fuertes aisladas."))
     with x2:
-        risk_text=(", ".join(negatives) if negatives else "No hay seÃ±ales negativas fuertes en mÃ³dulos automÃ¡ticos.")
-        if manual.get("pitch_limit"): risk_text += " Â· Pitch limit / leash concern."
-        if manual.get("injury_return"): risk_text += " Â· Injury return."
-        if manual.get("opener"): risk_text += " Â· Opener/bulk role."
+        risk_text=(", ".join(negatives) if negatives else "No hay se\\u00f1ales negativas fuertes en m\\u00f3dulos autom\\u00e1ticos.")
+        if manual.get("pitch_limit"): risk_text += " \\u00b7 Pitch limit / leash concern."
+        if manual.get("injury_return"): risk_text += " \\u00b7 Injury return."
+        if manual.get("opener"): risk_text += " \\u00b7 Opener/bulk role."
         st.warning("**Riesgos:** "+risk_text)
 
-    st.subheader("ConclusiÃ³n final")
+    st.subheader("Conclusi\\u00f3n final")
     conf="A" if modules==9 else ("B" if modules==8 else "C")
-    st.write(f"**Calidad del anÃ¡lisis:** {conf} Â· {modules}/9 mÃ³dulos completos")
+    st.write(f"**Calidad del an\\u00e1lisis:** {conf} \\u00b7 {modules}/9 m\\u00f3dulos completos")
     st.write(f"**BF proyectados:** {proj['bf']:.1f}")
     st.write(f"**K% proyectado:** {proj['k_pct']:.1f}%")
     st.write(f"**Strikeouts proyectados:** {proj['central']:.2f}")
-    st.write(f"**Rango probable:** {proj['low']:.1f}â{proj['high']:.1f} K")
+    st.write(f"**Rango probable:** {proj['low']:.1f}\\u2013{proj['high']:.1f} K")
 
     if best:
         ev_val=safe_num(best.get("EV%"))/100 if safe_num(best.get("EV%")) is not None else None
@@ -1432,7 +1537,7 @@ with tab_analysis:
         grade=grade_bet(ev_val,edge_val,modules)
         decision="PASS / NO BET"
         if grade in ("A","B","C") and safe_num(best.get("EV%")) is not None and best["EV%"]>=3:
-            decision=f"{best['Market']} {best['Line']} Â· {best['Sportsbook']} {int(best['Odds']):+d}"
+            decision=f"{best['Market']} {best['Line']} \\u00b7 {best['Sportsbook']} {int(best['Odds']):+d}"
 
         st.markdown(
             f"""
@@ -1440,8 +1545,8 @@ with tab_analysis:
               <div style="font-size:.78rem;opacity:.7">DICTAMEN DEL MODELO</div>
               <div style="font-size:1.7rem;font-weight:850;margin:5px 0">{decision}</div>
               <div>
-                Model <b>{best['Model%']:.1f}%</b> Â· Fair <b>{best['Fair']:+.0f}</b> Â·
-                Edge <b>{best['Edge pp']:.1f} pp</b> Â· EV <b>{best['EV%']:.1f}%</b> Â·
+                Model <b>{best['Model%']:.1f}%</b> \\u00b7 Fair <b>{best['Fair']:+.0f}</b> \\u00b7
+                Edge <b>{best['Edge pp']:.1f} pp</b> \\u00b7 EV <b>{best['EV%']:.1f}%</b> \\u00b7
                 Grade <b>{grade}</b>
               </div>
             </div>
@@ -1452,15 +1557,15 @@ with tab_analysis:
             diff=proj["central"]-bartolo_projection
             st.info(
                 f"B.A.R.T.O.L.O. comparison: Action {bartolo_projection:.1f} K vs model {proj['central']:.2f} K "
-                f"(difference {diff:+.2f} K). Se usa como validaciÃ³n externa, no como sustituto."
+                f"(difference {diff:+.2f} K). Se usa como validaci\\u00f3n externa, no como sustituto."
             )
 
-        st.caption("Una calificaciÃ³n A NO obliga a apostar. Sin edge/EV suficiente = NO BET.")
+        st.caption("Una calificaci\\u00f3n A NO obliga a apostar. Sin edge/EV suficiente = NO BET.")
     else:
-        st.warning("No hay lÃ­neas vÃ¡lidas cargadas. Dictamen: PASS hasta introducir precios reales.")
+        st.warning("No hay l\\u00edneas v\\u00e1lidas cargadas. Dictamen: PASS hasta introducir precios reales.")
 
     st.progress(modules/9)
-    st.caption(" Â· ".join(f"{k} {'â' if v else 'â³'}" for k,v in status.items()))
+    st.caption(" \\u00b7 ".join(f"{k} {'\\u2705' if v else '\\u23f3'}" for k,v in status.items()))
 
 # ------------------------------------------------------------
 # SOURCES
@@ -1470,7 +1575,7 @@ with tab_sources:
     src=pd.DataFrame([
         {"Fuente":"MLB Stats API","Uso":"Schedule, probables, season-to-date, logs, lineup, weather, umpire","Estado":"OK" if mlb else "Partial"},
         {"Fuente":"Baseball Savant / Statcast","Uso":"Plate discipline, arsenal, pitch movement, spin, pitch-type matchup","Estado":"OK" if not sc_pitcher.empty else "Unavailable"},
-        {"Fuente":"Savant SO Park Factor","Uso":"M7","Estado":f"{fmt(park_so,0)} Â· {park_source}"},
+        {"Fuente":"Savant SO Park Factor","Uso":"M7","Estado":f"{fmt(park_so,0)} \\u00b7 {park_source}"},
         {"Fuente":"Baseball-Reference","Uso":"Validation cross-check","Estado":"OK" if br else "No match"},
         {"Fuente":"FanGraphs","Uso":"Validation / xFIP / SIERA when reachable","Estado":fg_status},
         {"Fuente":"Action Network PRO","Uso":"B.A.R.T.O.L.O., % Bets, % Money, sharp, movement","Estado":"Manual PRO validation"},
@@ -1483,4 +1588,4 @@ with tab_sources:
         "preventing future-data leakage. Core projection inputs use cutoff-safe MLB + Statcast data."
     )
 
-st.caption("V2.0 LIVE TEST Â· Structure frozen. Next phase: real-game logging, calibration and evidence-based adjustments.")
+st.caption("V2.2 LIVE TEST \\u00b7 Structure frozen. Next phase: real-game logging, calibration and evidence-based adjustments.")
