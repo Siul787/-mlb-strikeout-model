@@ -21,7 +21,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.0 LIVE TEST
+# V3.1 LIVE TEST
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -121,6 +121,44 @@ st.markdown(
     .mini-stat{display:inline-block;padding:3px 7px;border-radius:999px;margin-right:4px;margin-top:5px;font-size:.70rem;background:rgba(79,140,255,.10);border:1px solid rgba(79,140,255,.12)}
     .state-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
     .dot-green{background:var(--green)} .dot-gold{background:var(--gold)}
+
+    .board-grid{
+      display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px;margin:12px 0 18px
+    }
+    .board-game{
+      background:linear-gradient(150deg,rgba(23,27,37,.98),rgba(13,15,21,.99));
+      border:1px solid rgba(130,145,180,.18);border-radius:14px;padding:10px;
+      min-height:178px;box-shadow:0 5px 16px rgba(0,0,0,.14)
+    }
+    .board-time{font-size:.62rem;opacity:.56;text-align:center;margin-bottom:7px}
+    .board-team{
+      display:grid;grid-template-columns:26px 1fr auto;align-items:center;gap:6px;
+      padding:5px 0;border-bottom:1px solid rgba(140,150,175,.08)
+    }
+    .board-team:last-of-type{border-bottom:0}
+    .board-logo{width:25px;height:25px;object-fit:contain}
+    .board-abbr{font-size:.78rem;font-weight:850}
+    .board-pitcher{font-size:.62rem;opacity:.62;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .board-k{font-size:.67rem;font-weight:750}
+    .board-actions{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:7px}
+    .board-link{
+      text-decoration:none!important;text-align:center;padding:5px 4px;border-radius:8px;
+      font-size:.61rem;font-weight:850;color:#dce7ff!important;
+      background:rgba(63,116,220,.13);border:1px solid rgba(79,140,255,.22)
+    }
+    .board-link:hover{background:rgba(79,140,255,.22)}
+    .board-legend{font-size:.70rem;opacity:.55;margin-top:-8px;margin-bottom:12px}
+    @media (max-width:1100px){.board-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
+    @media (max-width:760px){
+      .board-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+      .board-game{padding:7px;min-height:158px;border-radius:11px}
+      .board-logo{width:21px;height:21px}
+      .board-team{grid-template-columns:22px 1fr auto;gap:4px}
+      .board-abbr{font-size:.69rem}
+      .board-pitcher,.board-time,.board-link{font-size:.54rem}
+      .board-k{font-size:.58rem}
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -757,8 +795,8 @@ def opponent_pitch_type_table(team_offense: pd.DataFrame):
 
         xba = pd.to_numeric(g["estimated_ba_using_speedangle"],errors="coerce").mean() if "estimated_ba_using_speedangle" in g.columns else None
         xwoba = pd.to_numeric(g["estimated_woba_using_speedangle"],errors="coerce").mean() if "estimated_woba_using_speedangle" in g.columns else None
+        xslg = pd.to_numeric(g["estimated_slg_using_speedangle"],errors="coerce").mean() if "estimated_slg_using_speedangle" in g.columns else None
 
-        # xSLG is not a direct Statcast pitch-level field; leave explicit N/A.
         launch = pd.to_numeric(g["launch_speed"],errors="coerce") if "launch_speed" in g.columns else pd.Series(dtype=float)
         hardhit = (launch >= 95).sum()/launch.notna().sum()*100 if launch.notna().sum() else None
 
@@ -777,13 +815,70 @@ def opponent_pitch_type_table(team_offense: pd.DataFrame):
             "K%": pa_rates_row["K%"],
             "PutAway%": None,
             "xBA": xba,
-            "xSLG": None,
+            "xSLG": xslg,
             "xwOBA": xwoba,
             "HardHit%": hardhit,
             "RV100": rv100,
         })
     result = pd.DataFrame(rows)
     return result.sort_values("Pitches",ascending=False) if not result.empty else result
+
+
+
+def merge_pitch_type_fallback(primary: pd.DataFrame, fallback: pd.DataFrame):
+    """
+    Fill missing Savant aggregate fields from cutoff-safe raw Statcast.
+    Pitch code/name matching is normalized so FF/4-Seam, ST/Sweeper, etc. join correctly.
+    """
+    if primary is None or primary.empty:
+        return fallback.copy() if isinstance(fallback,pd.DataFrame) else pd.DataFrame()
+    if fallback is None or fallback.empty:
+        return primary.copy()
+
+    p=primary.copy()
+    f=fallback.copy()
+
+    def canon(v):
+        n=normalize_name(v)
+        aliases={
+            "4 seam":"ff","4 seam fastball":"ff","four seam":"ff","ff":"ff",
+            "sinker":"si","si":"si",
+            "slider":"sl","sl":"sl",
+            "sweeper":"st","st":"st",
+            "cutter":"fc","fc":"fc",
+            "changeup":"ch","change":"ch","ch":"ch",
+            "curveball":"cu","curve":"cu","cu":"cu",
+            "splitter":"fs","split finger":"fs","fs":"fs",
+            "slurve":"sv","sv":"sv",
+            "knuckle curve":"kc","kc":"kc"
+        }
+        return aliases.get(n,n)
+
+    p["_join"]=p["Code"].map(canon) if "Code" in p.columns else p["Pitch"].map(canon)
+    f["_join"]=f["Code"].map(canon) if "Code" in f.columns else f["Pitch"].map(canon)
+
+    desired=["Pitches","PA","BA","SLG","wOBA","Whiff%","K%","PutAway%","xBA","xSLG","xwOBA","HardHit%","RV100","Run Value"]
+    fmap={r["_join"]:r for _,r in f.iterrows()}
+    for i,row in p.iterrows():
+        fr=fmap.get(row["_join"])
+        if fr is None:
+            continue
+        for col in desired:
+            if col not in p.columns:
+                p[col]=None
+            cur=p.at[i,col]
+            missing = cur is None
+            if not missing:
+                try: missing = pd.isna(cur)
+                except Exception: pass
+            if missing and col in fr.index:
+                val=fr.get(col)
+                if val is not None:
+                    try:
+                        if pd.isna(val): continue
+                    except Exception: pass
+                    p.at[i,col]=val
+    return p.drop(columns=["_join"],errors="ignore")
 
 
 def split_metrics(df: pd.DataFrame, side: str):
@@ -856,18 +951,33 @@ SAVANT_SO_VERIFIED_CACHE = {(2026,"wrigley field"):102.0}
 
 def park_so_factor(venue, year):
     target = normalize_name(venue)
+    aliases={
+        "comerica park":["comerica park","comerica"],
+        "wrigley field":["wrigley field","wrigley"],
+        "oracle park":["oracle park","oracle"],
+        "rogers centre":["rogers centre","rogers center"],
+        "rogers center":["rogers centre","rogers center"],
+    }
+    targets=set(aliases.get(target,[target]))
+    targets.add(target)
+
     df = savant_park_factors(year)
     if not df.empty:
-        vn = df["Venue"].astype(str).map(normalize_name)
-        hit = df[vn.eq(target)]
-        if not hit.empty:
-            x = safe_num(hit.iloc[0].get("SO"))
-            if x is not None:
-                return x, "Savant live"
+        venue_col=next((c for c in df.columns if normalize_name(c) in ("venue","park","stadium","name")),None)
+        so_col=next((c for c in df.columns if normalize_name(c) in ("so","strikeout","strikeouts","k")),None)
+        if venue_col and so_col:
+            vn=df[venue_col].astype(str).map(normalize_name)
+            mask=vn.apply(lambda x:any(t in x or x in t for t in targets if t))
+            hit=df[mask]
+            if not hit.empty:
+                x=safe_num(hit.iloc[0].get(so_col))
+                if x is not None:
+                    return x,"Baseball Savant live"
+
     cached = SAVANT_SO_VERIFIED_CACHE.get((year,target))
     if cached is not None:
         return cached, "Savant verified cache"
-    return None, "Unavailable"
+    return None, "SOURCE RETRY NEEDED"
 
 
 # ============================================================
@@ -1203,7 +1313,10 @@ def technical_analysis(mlb,pdisc,split_l,split_r,opp_disc,team_general,team_spli
         for _,rr in top.iterrows():
             pn=str(rr.get("Pitch"));pieces.append(f"{pn} {fmt(rr.get('Usage%'),1,'%')} uso / {fmt(rr.get('Whiff%'),1,'%')} Whiff")
             if isinstance(opp_pitch,pd.DataFrame) and not opp_pitch.empty:
-                hit=opp_pitch[opp_pitch["Pitch"].astype(str).map(normalize_name).eq(normalize_name(pn))]
+                aliases={"4 seam":"ff","4 seam fastball":"ff","sweeper":"st","cutter":"fc","sinker":"si","changeup":"ch","slider":"sl","curveball":"cu","splitter":"fs"}
+                pkey=aliases.get(normalize_name(pn),normalize_name(pn))
+                keys=opp_pitch["Code"].astype(str).str.lower() if "Code" in opp_pitch.columns else opp_pitch["Pitch"].astype(str).map(lambda x: aliases.get(normalize_name(x),normalize_name(x)))
+                hit=opp_pitch[keys.eq(pkey)]
                 if not hit.empty:
                     rh=hit.iloc[0];matches.append(f"vs {pn}: {fmt(rh.get('Whiff%'),1,'%')} Whiff, {fmt(rh.get('K%'),1,'%')} K, {fmt(rh.get('xwOBA'),3)} xwOBA")
                     if safe_num(rh.get("Whiff%")) is not None:vals.append(safe_num(rh.get("Whiff%")))
@@ -1281,7 +1394,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.0 LIVE TEST · Slate → Pitcher → Full Matchup Lab</div>
+      <div style="opacity:.70;margin-top:6px">V3.1 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -1309,59 +1422,70 @@ if st.session_state.get("selected_pitcher_id") not in by_id:
     st.session_state["selected_pitcher_id"]=None
     st.session_state["view_mode"]="slate"
 
+# Query-param navigation allows the daily board to be pure compact HTML.
+qp_pitch = st.query_params.get("pitcher")
+if qp_pitch and qp_pitch in by_id:
+    st.session_state["selected_pitcher_id"]=qp_pitch
+    st.session_state["view_mode"]="analysis"
+
 if st.session_state["view_mode"]=="slate":
     games=slate_games(options)
     st.markdown(
         f"""
         <div class="slate-header">
           <div>
-            <div class="section-label">SLATE DEL DÍA</div>
-            <div style="font-size:1.4rem;font-weight:850">{game_date.strftime('%A · %B %d').upper()}</div>
+            <div class="section-label">DAILY PITCHER BOARD</div>
+            <div style="font-size:1.38rem;font-weight:850">{game_date.strftime('%A · %B %d').upper()}</div>
           </div>
-          <div class="slate-count">{len(games)} GAMES · {len(options)} PROBABLE STARTERS</div>
+          <div class="slate-count">{len(games)} GAMES · {len(options)} STARTERS</div>
         </div>
         """, unsafe_allow_html=True
     )
+
+    cards=[]
     for game_opts in games:
         first=game_opts[0]
-        teams=[]
-        for x in game_opts:
-            if x["team"] not in teams: teams.append(x["team"])
-        matchup=" @ ".join(teams[:2]) if len(teams)>=2 else first.get("team","GAME")
-        st.markdown(
-            f"""
-            <div class="match-card">
-              <div class="match-top">
-                <div><div class="match-title">{matchup}</div><div class="pitcher-sub">{first.get('venue','')}</div></div>
-                <div class="match-time">{first.get('game_time','TBD')}</div>
-              </div>
-            """, unsafe_allow_html=True
-        )
-        for opt in game_opts:
-            status_text,dot_class,snap=slate_status(opt,game_date)
-            ctext,cbutton=st.columns([3.2,1.0])
-            with ctext:
-                st.markdown(
-                    f"""
-                    <div class="pitcher-row">
-                      <div class="pitcher-name">{opt['pitcher_name']} <span style="opacity:.48">({opt['throwing_hand'][:1]})</span></div>
-                      <div class="pitcher-sub">vs {opt['opponent']}</div>
-                      <span class="mini-stat">K% {fmt(snap.get('K%'),1,'%')}</span>
-                      <span class="mini-stat">K/start {fmt(snap.get('K/start'),1)}</span>
-                      <span class="mini-stat">BF/start {fmt(snap.get('BF/start'),1)}</span>
-                      <div class="pitcher-sub" style="margin-top:6px"><span class="state-dot {dot_class}"></span>{status_text}</div>
-                    </div>
-                    """, unsafe_allow_html=True
-                )
-            with cbutton:
-                st.write("")
-                st.write("")
-                if st.button("ANALIZAR",key=f"open_{opt['selection_id']}",use_container_width=True):
-                    st.session_state["selected_pitcher_id"]=opt["selection_id"]
-                    st.session_state["view_mode"]="analysis"
-                    st.rerun()
-        st.markdown("</div>",unsafe_allow_html=True)
-    st.info("El slate no da picks. Selecciona un abridor para abrir su análisis M1–M9.")
+        by_side={x.get("team_side"):x for x in game_opts}
+        away=by_side.get("away",game_opts[0] if game_opts else None)
+        home=by_side.get("home",game_opts[1] if len(game_opts)>1 else None)
+        if away is None or home is None:
+            continue
+
+        away_status,_,away_snap=slate_status(away,game_date)
+        home_status,_,home_snap=slate_status(home,game_date)
+        away_logo=f"https://www.mlbstatic.com/team-logos/{away['team_id']}.svg"
+        home_logo=f"https://www.mlbstatic.com/team-logos/{home['team_id']}.svg"
+
+        def abbr(name):
+            words=str(name).replace("D-backs","Diamondbacks").split()
+            return "".join(w[0] for w in words[-2:]).upper() if len(words)>=2 else str(name)[:3].upper()
+
+        def pshort(opt):
+            parts=opt["pitcher_name"].split()
+            return (parts[0][0]+". "+parts[-1]) if len(parts)>1 else opt["pitcher_name"]
+
+        cards.append(f"""
+        <div class="board-game">
+          <div class="board-time">{first.get('game_time','TBD')} · {first.get('venue','')}</div>
+          <div class="board-team">
+            <img class="board-logo" src="{away_logo}">
+            <div><div class="board-abbr">{abbr(away['team'])}</div><div class="board-pitcher">{pshort(away)} ({away['throwing_hand'][:1]})</div></div>
+            <div class="board-k">{fmt(away_snap.get('K%'),1,'%')}</div>
+          </div>
+          <div class="board-team">
+            <img class="board-logo" src="{home_logo}">
+            <div><div class="board-abbr">{abbr(home['team'])}</div><div class="board-pitcher">{pshort(home)} ({home['throwing_hand'][:1]})</div></div>
+            <div class="board-k">{fmt(home_snap.get('K%'),1,'%')}</div>
+          </div>
+          <div class="board-actions">
+            <a class="board-link" href="?pitcher={away['selection_id']}">ANALIZAR {abbr(away['team'])}</a>
+            <a class="board-link" href="?pitcher={home['selection_id']}">ANALIZAR {abbr(home['team'])}</a>
+          </div>
+        </div>
+        """)
+
+    st.markdown('<div class="board-grid">'+"".join(cards)+'</div>',unsafe_allow_html=True)
+    st.markdown('<div class="board-legend">K% rápido = perfil base pregame. El board NO emite apuestas; abre un pitcher para M1–M9.</div>',unsafe_allow_html=True)
     st.stop()
 
 selected_id=st.session_state["selected_pitcher_id"]
@@ -1370,6 +1494,7 @@ back_col,title_col=st.columns([.65,3.35])
 with back_col:
     if st.button("← SLATE",use_container_width=True):
         st.session_state["view_mode"]="slate"
+        st.query_params.clear()
         st.rerun()
 
 cutoff=game_cutoff(game_date)
@@ -1422,16 +1547,27 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
 
     opp_sc_all = pd.DataFrame()
     opp_off = pd.DataFrame()
-    if not opp_disc or opp_pitch.empty:
-        try:
-            opp_sc_all = team_statcast(opp_abbr,sc_start,cutoff_str) if opp_abbr else pd.DataFrame()
-            opp_off = offensive_team_rows(opp_sc_all,opp_abbr) if opp_abbr else pd.DataFrame()
-            if not opp_disc and not opp_off.empty:
-                opp_disc = plate_discipline(opp_off); opp_disc_source="RAW_STATCAST_FALLBACK"
-            if opp_pitch.empty and not opp_off.empty:
-                opp_pitch = opponent_pitch_type_table(opp_off); opp_pitch_source="RAW_STATCAST_FALLBACK"
-        except Exception:
-            pass
+    try:
+        # Raw Statcast is cutoff-safe and is also used to fill fields that the
+        # Savant aggregate table omits (notably expected metrics).
+        opp_sc_all = team_statcast(opp_abbr,sc_start,cutoff_str) if opp_abbr else pd.DataFrame()
+        opp_off = offensive_team_rows(opp_sc_all,opp_abbr) if opp_abbr else pd.DataFrame()
+        if not opp_disc and not opp_off.empty:
+            opp_disc = plate_discipline(opp_off)
+            opp_disc_source="RAW_STATCAST_FALLBACK"
+        if not opp_off.empty:
+            raw_pitch = opponent_pitch_type_table(opp_off)
+            if opp_pitch.empty:
+                opp_pitch = raw_pitch
+                opp_pitch_source="RAW_STATCAST_FALLBACK"
+            else:
+                before_missing = int(opp_pitch.isna().sum().sum())
+                opp_pitch = merge_pitch_type_fallback(opp_pitch, raw_pitch)
+                after_missing = int(opp_pitch.isna().sum().sum())
+                if after_missing < before_missing:
+                    opp_pitch_source = f"{opp_pitch_source} + RAW_STATCAST_FILL"
+    except Exception:
+        pass
 
     park_so,park_source=park_so_factor(p["venue"],game_date.year)
 
@@ -1575,7 +1711,7 @@ with tab_modules:
         st.markdown("**Rival vs pitch type**")
         if not opp_pitch.empty:
             show_cols=[c for c in ["Pitch","Pitches","PA","BA","SLG","wOBA","Whiff%","K%","PutAway%","xBA","xSLG","xwOBA","HardHit%","RV100","Run Value"] if c in opp_pitch.columns]
-            st.dataframe(opp_pitch[show_cols].round(3),hide_index=True,use_container_width=True)
+            st.dataframe(clean_display_frame(opp_pitch[show_cols].round(3),"—"),hide_index=True,use_container_width=True)
             st.caption(f"Fuente rival vs pitch type: {opp_pitch_source} · Baseball Savant Pitch Arsenal Stats.")
         else:
             st.error("ERROR DE FUENTE: Savant no devolvió el perfil rival por tipo de pitcheo.")
@@ -1846,7 +1982,7 @@ with tab_sources:
         {"Fuente":"Savant Team Page","Uso":"Opponent Contact, Chase, Zone, Whiff","Estado":opp_disc_source},
         {"Fuente":"Savant Pitch Arsenal","Uso":"Opponent vs pitch type","Estado":opp_pitch_source},
         {"Fuente":"Savant SO Park Factor","Uso":"M7","Estado":f"{fmt(park_so,0)} · {park_source}"},
-        {"Fuente":"Baseball-Reference","Uso":"Validation cross-check","Estado":"OK" if br else "No match"},
+        {"Fuente":"Baseball-Reference","Uso":"Cross-check + fallback cuando la métrica existe públicamente","Estado":"OK" if br else "No match"},
         {"Fuente":"FanGraphs","Uso":"Validation / xFIP / SIERA when reachable","Estado":fg_status},
         {"Fuente":"Action Network PRO","Uso":"B.A.R.T.O.L.O., % Bets, % Money, sharp, movement","Estado":"Manual PRO validation"},
         {"Fuente":"DraftKings / FanDuel","Uso":"Official model prices in current phase","Estado":"Manual line/odds entry"},
@@ -1854,8 +1990,8 @@ with tab_sources:
     st.dataframe(src,hide_index=True,use_container_width=True)
 
     st.warning(
-        "Important: FanGraphs/BBRef full-season leaderboards are validation only and are NOT fed into historical pregame projections, "
-        "preventing future-data leakage. Core projection inputs use cutoff-safe MLB + Statcast data."
+        "Important: full-season leaderboards are never allowed to leak future data into historical pregame projections. "
+        "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.0 LIVE TEST · Structure frozen. Next phase: real-game logging, calibration and evidence-based adjustments.")
+st.caption("V3.1 LIVE TEST · Compact Daily Board · multi-source fallback · cutoff-safe pregame model.")
