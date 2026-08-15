@@ -21,7 +21,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.1.1 LIVE TEST
+# V3.1.2 LIVE TEST
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -1262,6 +1262,15 @@ def direction(value, neutral, lower_good=False, band=1.0):
     return "NEUTRAL"
 
 
+
+def clean_display_frame(df, missing="—"):
+    """Display-only cleanup: replace NaN/None/inf without changing model calculations."""
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    out = out.replace([float("inf"), float("-inf")], pd.NA)
+    return out.fillna(missing)
+
 def technical_analysis(mlb,pdisc,split_l,split_r,opp_disc,team_general,team_split,arsenal,opp_pitch,recent,park_so,lineup,proj,manual,log):
     items=[]
     k_pct=safe_num(mlb.get("calc_k_pct"));k9=safe_num(mlb.get("strikeoutsPer9Inn"))
@@ -1394,7 +1403,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.1.1 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
+      <div style="opacity:.70;margin-top:6px">V3.1.2 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -1994,4 +2003,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.1.1 LIVE TEST · Compact Daily Board · multi-source fallback · cutoff-safe pregame model.")
+st.caption("V3.1.2 LIVE TEST · Compact Daily Board · multi-source fallback · cutoff-safe pregame model.")
