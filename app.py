@@ -1650,7 +1650,6 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
     park_so,park_source=park_so_factor(p["venue"],game_date.year)
 
     raw_lineup=confirmed_lineup(feed,p["opponent_side"])
-    lineup=enrich_lineup_rows(lineup,game_date.year,cutoff_str)
     lineup=enrich_lineup(raw_lineup,game_date.year,cutoff_str,p["throwing_hand"]) if raw_lineup else []
 
     recent=recent_summary(log)
