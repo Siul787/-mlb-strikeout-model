@@ -21,7 +21,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.1.2 LIVE TEST
+# V3.1.3 LIVE TEST
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -516,6 +516,18 @@ def _find_col(columns, *needles):
             return c
     return None
 
+def _metric_col(columns, exact_names, contains_names=()):
+    norm={c:normalize_name(c) for c in columns}
+    exact={normalize_name(x) for x in exact_names}
+    for c,n in norm.items():
+        if n in exact:
+            return c
+    for c,n in norm.items():
+        if any(normalize_name(x) in n for x in contains_names):
+            return c
+    return None
+
+
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def savant_team_plate_discipline(team_id: int, season: int):
@@ -593,10 +605,17 @@ def savant_team_pitch_type(team_id: int, season: int):
     if not pitch_col or not pitches_col: return pd.DataFrame(),"COLUMNS_NOT_FOUND"
 
     mapping = {
-        "BA":col("ba"),"SLG":col("slg"),"wOBA":col("woba"),"Whiff%":col("whiff"),
-        "K%":col("k"),"PutAway%":col("put","away"),"xBA":col("xba"),
-        "xSLG":col("xslg"),"xwOBA":col("xwoba"),"HardHit%":col("hard","hit"),
-        "RV100":col("rv","100") or col("run","value","100")
+        "BA":_metric_col(cols,["ba","batting average"],["ba"]),
+        "SLG":_metric_col(cols,["slg","slugging"],["slg"]),
+        "wOBA":_metric_col(cols,["woba"],["woba"]),
+        "Whiff%":_metric_col(cols,["whiff","whiff %","whiff_percent"],["whiff"]),
+        "K%":_metric_col(cols,["k%","k_percent","strikeout %"],["k percent","strikeout"]),
+        "PutAway%":_metric_col(cols,["putaway%","put away %","put_away"],["put away","putaway"]),
+        "xBA":_metric_col(cols,["xba","estimated ba","estimated_ba"],["xba","estimated ba"]),
+        "xSLG":_metric_col(cols,["xslg","estimated slg","estimated_slg"],["xslg","estimated slg"]),
+        "xwOBA":_metric_col(cols,["xwoba","estimated woba","estimated_woba"],["xwoba","estimated woba"]),
+        "HardHit%":_metric_col(cols,["hardhit%","hard hit %","hard_hit_percent"],["hard hit","hardhit"]),
+        "RV100":_metric_col(cols,["rv100","rv/100","run value / 100 pitches"],["rv 100","run value 100"])
     }
     rv_col=col("run","value")
 
@@ -825,6 +844,22 @@ def opponent_pitch_type_table(team_offense: pd.DataFrame):
 
 
 
+
+PITCH_CANON = {
+    "ff":"ff","4 seam":"ff","4 seam fastball":"ff","four seam":"ff","four seam fastball":"ff",
+    "si":"si","sinker":"si",
+    "sl":"sl","slider":"sl",
+    "st":"st","sweeper":"st",
+    "fc":"fc","cutter":"fc",
+    "ch":"ch","change":"ch","changeup":"ch",
+    "cu":"cu","curve":"cu","curveball":"cu",
+    "kc":"kc","knuckle curve":"kc","knuckle curveball":"kc",
+    "fs":"fs","splitter":"fs","split finger":"fs","split fingered":"fs",
+    "sv":"sv","slurve":"sv"
+}
+def canonical_pitch(v):
+    return PITCH_CANON.get(normalize_name(v), normalize_name(v))
+
 def merge_pitch_type_fallback(primary: pd.DataFrame, fallback: pd.DataFrame):
     """
     Fill missing Savant aggregate fields from cutoff-safe raw Statcast.
@@ -839,20 +874,7 @@ def merge_pitch_type_fallback(primary: pd.DataFrame, fallback: pd.DataFrame):
     f=fallback.copy()
 
     def canon(v):
-        n=normalize_name(v)
-        aliases={
-            "4 seam":"ff","4 seam fastball":"ff","four seam":"ff","ff":"ff",
-            "sinker":"si","si":"si",
-            "slider":"sl","sl":"sl",
-            "sweeper":"st","st":"st",
-            "cutter":"fc","fc":"fc",
-            "changeup":"ch","change":"ch","ch":"ch",
-            "curveball":"cu","curve":"cu","cu":"cu",
-            "splitter":"fs","split finger":"fs","fs":"fs",
-            "slurve":"sv","sv":"sv",
-            "knuckle curve":"kc","kc":"kc"
-        }
-        return aliases.get(n,n)
+        return canonical_pitch(v)
 
     p["_join"]=p["Code"].map(canon) if "Code" in p.columns else p["Pitch"].map(canon)
     f["_join"]=f["Code"].map(canon) if "Code" in f.columns else f["Pitch"].map(canon)
@@ -1042,6 +1064,26 @@ def match_pitcher_row(df,name,mlbam_id=None,crosswalk=None):
     return {}
 
 
+
+@st.cache_data(ttl=21600,show_spinner=False)
+def mlb_people_info(player_ids):
+    ids=[str(int(x)) for x in player_ids if safe_num(x) is not None]
+    if not ids:return {}
+    out={}
+    # MLB Stats API supports comma-separated personIds in hydrate-style endpoint poorly,
+    # so batch individual lightweight calls; cache prevents repeated network cost.
+    for pid in ids:
+        try:
+            js=get_json(f"https://statsapi.mlb.com/api/v1/people/{pid}")
+            person=(js.get("people") or [{}])[0]
+            out[int(pid)]={
+                "Bats":((person.get("batSide") or {}).get("code") or (person.get("batSide") or {}).get("description")),
+                "FullName":person.get("fullName")
+            }
+        except Exception:
+            out[int(pid)]={"Bats":None,"FullName":None}
+    return out
+
 # ============================================================
 # LINEUP
 # ============================================================
@@ -1069,6 +1111,33 @@ def hitter_k_profile(pid,season,end_date,pitcher_hand):
 def enrich_lineup(lineup,season,end_date,pitcher_hand):
     return [{**r,**hitter_k_profile(r["player_id"],season,end_date,pitcher_hand)} for r in lineup]
 
+
+
+def enrich_lineup_rows(lineup_rows, season, cutoff_str):
+    if not lineup_rows:return lineup_rows
+    ids=[r.get("PlayerID") or r.get("player_id") or r.get("id") for r in lineup_rows]
+    people=mlb_people_info(ids)
+    for r in lineup_rows:
+        pid=safe_num(r.get("PlayerID") or r.get("player_id") or r.get("id"))
+        if pid is not None:
+            pinfo=people.get(int(pid),{})
+            if not r.get("Bats") or str(r.get("Bats")).upper() in ("N/A","NONE",""):
+                r["Bats"]=pinfo.get("Bats")
+        # Never expose raw None in the UI.
+        for c in ("Contact%","Whiff%"):
+            if r.get(c) is None:
+                r[c]="—"
+    return lineup_rows
+
+def lineup_quality(lineup_rows):
+    if len(lineup_rows)<9:
+        return False,["lineup no confirmado"]
+    issues=[]
+    if sum(1 for r in lineup_rows if str(r.get("Bats") or "").upper() in ("L","R","S"))<9:
+        issues.append("handedness incompleto")
+    k_valid=sum(1 for r in lineup_rows if safe_num(r.get("K% vs hand")) is not None)
+    if k_valid<7:issues.append("K% vs hand insuficiente")
+    return len(issues)==0,issues
 
 def lineup_k_pct(lineup):
     vals = [safe_num(r.get("K% vs hand")) for r in lineup]
@@ -1403,7 +1472,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.1.2 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
+      <div style="opacity:.70;margin-top:6px">V3.1.3 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -1581,6 +1650,7 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
     park_so,park_source=park_so_factor(p["venue"],game_date.year)
 
     raw_lineup=confirmed_lineup(feed,p["opponent_side"])
+    lineup=enrich_lineup_rows(lineup,game_date.year,cutoff_str)
     lineup=enrich_lineup(raw_lineup,game_date.year,cutoff_str,p["throwing_hand"]) if raw_lineup else []
 
     recent=recent_summary(log)
@@ -1721,7 +1791,7 @@ with tab_modules:
         if not opp_pitch.empty:
             show_cols=[c for c in ["Pitch","Pitches","PA","BA","SLG","wOBA","Whiff%","K%","PutAway%","xBA","xSLG","xwOBA","HardHit%","RV100","Run Value"] if c in opp_pitch.columns]
             st.dataframe(clean_display_frame(opp_pitch[show_cols].round(3),"—"),hide_index=True,use_container_width=True)
-            st.caption(f"Fuente rival vs pitch type: {opp_pitch_source} · Baseball Savant Pitch Arsenal Stats.")
+            st.caption(f"Fuente rival vs pitch type: {opp_pitch_source}. Expected stats se exigen antes de marcar M5 completo.")
         else:
             st.error("ERROR DE FUENTE: Savant no devolvió el perfil rival por tipo de pitcheo.")
 
@@ -1876,15 +1946,25 @@ analysis_items=technical_analysis(
 )
 
 # Data completeness is based on actual model modules, not validation websites.
+
+def pitch_matchup_quality(df):
+    if not isinstance(df,pd.DataFrame) or df.empty:return False
+    required=["Whiff%","K%","xBA","xSLG","xwOBA"]
+    present=0
+    for c in required:
+        if c in df.columns and pd.to_numeric(df[c],errors="coerce").notna().any():
+            present+=1
+    return present>=4
+
 status={
     "M1":bool(mlb and not sc_pitcher.empty),
     "M2":bool(mlb and log),
     "M3":bool(not sc_pitcher.empty),
     "M4":bool(team_general and opp_disc and all(safe_num(opp_disc.get(x)) is not None for x in ("Whiff%","Contact%","Chase%","Zone%"))),
-    "M5":bool(not arsenal.empty and not opp_pitch.empty),
+    "M5":bool(not arsenal.empty and pitch_matchup_quality(opp_pitch)),
     "M6":bool(not recent_sc.empty),
     "M7":bool(park_so is not None),
-    "M8":bool(len(lineup)>=9),
+    "M8":bool(lineup_quality(lineup)[0]),
     "M9":bool('market_df' in locals() and not market_df.empty),
 }
 modules=sum(status.values())
@@ -1932,8 +2012,9 @@ with tab_analysis:
 
     st.subheader("Conclusión final")
     conf="A" if modules==9 else ("B" if modules==8 else "C")
-    provisional=not status.get("M8",False)
-    state_label="PROVISIONAL" if provisional else "FINAL PREGAME"
+    critical_ready=all(status.get(x,False) for x in ("M5","M7","M8"))
+    provisional=not critical_ready
+    state_label="DATA INCOMPLETE / PROVISIONAL" if provisional else "FINAL PREGAME"
     conf_class="confidence-a" if conf=="A" else ("confidence-b" if conf=="B" else "confidence-c")
     st.markdown(f'**Estado:** {state_label} · **Calidad:** <span class="{conf_class}">{conf}</span> · {modules}/9 módulos completos',
                 unsafe_allow_html=True)
@@ -1950,7 +2031,7 @@ with tab_analysis:
         if (not provisional) and grade in ("A","B","C") and safe_num(best.get("EV%")) is not None and best["EV%"]>=3:
             decision=f"{best['Market']} {best['Line']} · {best['Sportsbook']} {int(best['Odds']):+d}"
         elif provisional:
-            decision="ESPERAR LINEUP · PROYECCIÓN PROVISIONAL"
+            decision="ESPERAR DATOS CRÍTICOS · PROYECCIÓN PROVISIONAL"
 
         st.markdown(
             f"""
@@ -2003,4 +2084,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.1.2 LIVE TEST · Compact Daily Board · multi-source fallback · cutoff-safe pregame model.")
+st.caption("V3.1.3 LIVE TEST · Data-quality gate · expected-stat fallback · lineup handedness · cutoff-safe pregame model.")
