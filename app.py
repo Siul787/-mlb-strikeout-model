@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from io import StringIO
-from urllib.parse import urlencode
 import math
 import unicodedata
 
@@ -12,23 +11,25 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from pybaseball import (
+    statcast,
     statcast_pitcher,
     pitching_stats,
     pitching_stats_bref,
     playerid_lookup,
 )
 
-# =========================================================
-# CONFIG
-# =========================================================
+# ============================================================
+# MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
+# V2.0 LIVE TEST
+# ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 MLB_PEOPLE_URL = "https://statsapi.mlb.com/api/v1/people"
 MLB_TEAMS_URL = "https://statsapi.mlb.com/api/v1/teams"
 MLB_GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game"
 SAVANT_PARK_URL = "https://baseballsavant.mlb.com/leaderboard/statcast-park-factors"
-
-TIMEOUT = 25
+ACTION_PITCHING_PROPS_URL = "https://www.actionnetwork.com/mlb/props/pitching"
+TIMEOUT = 30
 
 PITCH_NAMES = {
     "FF": "4-Seam", "SI": "Sinker", "FC": "Cutter", "SL": "Slider",
@@ -37,13 +38,21 @@ PITCH_NAMES = {
     "KN": "Knuckleball", "SV": "Slurve",
 }
 
-# =========================================================
-# STYLE
-# =========================================================
+SWING_DESCRIPTIONS = {
+    "swinging_strike", "swinging_strike_blocked", "foul", "foul_tip",
+    "hit_into_play", "foul_bunt", "missed_bunt",
+}
+WHIFF_DESCRIPTIONS = {"swinging_strike", "swinging_strike_blocked", "missed_bunt"}
+CONTACT_DESCRIPTIONS = SWING_DESCRIPTIONS - WHIFF_DESCRIPTIONS
+CALLED_STRIKE_DESCRIPTIONS = {"called_strike"}
+
+# ============================================================
+# PAGE / STYLE
+# ============================================================
 
 st.set_page_config(
-    page_title="MLB K Model",
-    page_icon="\u26be",
+    page_title="MLB Starting Pitcher K Model",
+    page_icon="â¾",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -51,38 +60,45 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container {max-width: 1180px; padding-top: 1.2rem; padding-bottom: 3rem;}
-    h1, h2, h3 {letter-spacing: -0.02em;}
-    div[data-testid="stMetric"] {
-        border: 1px solid rgba(128,128,128,.18);
-        border-radius: 16px;
-        padding: 14px 14px 10px 14px;
-        background: rgba(128,128,128,.045);
-    }
-    div[data-testid="stMetricLabel"] {font-size: .82rem;}
+    .block-container {max-width:1180px;padding-top:.7rem;padding-bottom:4rem}
+    h1,h2,h3 {letter-spacing:-.025em}
     .hero {
-        border: 1px solid rgba(128,128,128,.22);
-        border-radius: 20px;
-        padding: 20px;
-        margin: 2px 0 18px 0;
-        background: linear-gradient(145deg, rgba(55,110,255,.10), rgba(128,128,128,.03));
+      border:1px solid rgba(128,128,128,.18);
+      border-radius:22px;padding:20px;
+      background:linear-gradient(135deg,rgba(26,93,255,.16),rgba(126,78,220,.07));
+      margin-bottom:14px
     }
-    .bet-card {
-        border: 2px solid rgba(55,110,255,.32);
-        border-radius: 20px;
-        padding: 18px;
-        margin-top: 10px;
-        background: rgba(55,110,255,.07);
+    .gamecard {
+      border:1px solid rgba(128,128,128,.18);
+      border-radius:20px;padding:18px;margin:8px 0 14px;
+      background:rgba(128,128,128,.035)
     }
-    .muted {opacity:.72; font-size:.9rem;}
+    .finalcard {
+      border:2px solid rgba(26,93,255,.36);
+      border-radius:22px;padding:20px;margin:14px 0;
+      background:linear-gradient(145deg,rgba(26,93,255,.18),rgba(26,93,255,.05))
+    }
+    .analysis-card {
+      border:1px solid rgba(128,128,128,.16);
+      border-radius:16px;padding:14px 16px;margin:8px 0;
+      background:rgba(128,128,128,.025)
+    }
+    .pill {
+      display:inline-block;padding:5px 9px;border-radius:999px;
+      background:rgba(128,128,128,.12);margin:3px;font-size:.78rem
+    }
+    div[data-testid="stMetric"] {
+      border:1px solid rgba(128,128,128,.14);border-radius:15px;
+      padding:11px;background:rgba(128,128,128,.028)
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# =========================================================
+# ============================================================
 # HELPERS
-# =========================================================
+# ============================================================
 
 class DataSourceError(Exception):
     pass
@@ -90,122 +106,142 @@ class DataSourceError(Exception):
 
 def get_json(url: str, params: dict | None = None) -> dict:
     try:
-        r = requests.get(url, params=params, timeout=TIMEOUT)
+        r = requests.get(
+            url, params=params, timeout=TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
         r.raise_for_status()
-        payload = r.json()
+        data = r.json()
     except (requests.RequestException, ValueError) as exc:
         raise DataSourceError(str(exc)) from exc
-    return payload if isinstance(payload, dict) else {}
+    return data if isinstance(data, dict) else {}
 
 
-def safe_num(value):
-    if value is None or value == "":
+def safe_num(v):
+    if v is None or v == "":
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
+    if isinstance(v, (int, float)):
+        return float(v)
     try:
-        return float(str(value).replace("%", "").replace(",", ""))
+        return float(str(v).replace("%", "").replace(",", ""))
     except (TypeError, ValueError):
         return None
 
 
-def fmt(value, decimals=1, suffix=""):
-    v = safe_num(value)
-    return "N/A" if v is None else f"{v:.{decimals}f}{suffix}"
+def fmt(v, decimals=1, suffix=""):
+    x = safe_num(v)
+    return "N/A" if x is None else f"{x:.{decimals}f}{suffix}"
 
 
-def normalize_name(value: str) -> str:
-    text = unicodedata.normalize("NFKD", str(value or ""))
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    return " ".join(text.lower().replace(".", "").replace("-", " ").split())
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
 
 def weighted_average(items, default=None):
     valid = [(safe_num(v), float(w)) for v, w in items if safe_num(v) is not None and w > 0]
     if not valid:
         return default
-    weight = sum(w for _, w in valid)
-    return sum(v * w for v, w in valid) / weight if weight else default
+    tw = sum(w for _, w in valid)
+    return sum(v*w for v, w in valid) / tw if tw else default
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def normalize_name(value):
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return " ".join(text.lower().replace(".", "").replace("-", " ").split())
+
+
+def innings_decimal(value):
+    if value is None:
+        return None
+    s = str(value)
+    if "." not in s:
+        return safe_num(s)
+    try:
+        whole, frac = s.split(".", 1)
+        return int(whole) + int(frac[:1]) / 3
+    except Exception:
+        return None
 
 
 def american_implied(odds):
     o = safe_num(odds)
     if o is None or o == 0:
         return None
-    return ((-o) / ((-o) + 100) if o < 0 else 100 / (o + 100)) * 100
+    return ((-o)/((-o)+100) if o < 0 else 100/(o+100)) * 100
 
 
 def fair_american(prob):
     p = safe_num(prob)
     if p is None or p <= 0 or p >= 1:
         return None
-    return -100 * p / (1 - p) if p >= .5 else 100 * (1 - p) / p
+    return -100*p/(1-p) if p >= .5 else 100*(1-p)/p
 
 
 def profit_per_dollar(odds):
     o = safe_num(odds)
     if o is None or o == 0:
         return None
-    return o / 100 if o > 0 else 100 / abs(o)
+    return o/100 if o > 0 else 100/abs(o)
 
 
 def ev_per_dollar(prob, odds):
     p = safe_num(prob)
     profit = profit_per_dollar(odds)
-    if p is None or profit is None:
-        return None
-    return p * profit - (1 - p)
+    return None if p is None or profit is None else p*profit - (1-p)
 
 
 def poisson_pmf(k, lam):
-    return math.exp(-lam + k * math.log(lam) - math.lgamma(k + 1)) if lam > 0 else (1.0 if k == 0 else 0.0)
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return math.exp(-lam + k*math.log(lam) - math.lgamma(k+1))
 
 
 def poisson_cdf(k, lam):
     if k < 0:
         return 0.0
-    return sum(poisson_pmf(i, lam) for i in range(k + 1))
+    return sum(poisson_pmf(i, lam) for i in range(k+1))
 
 
 def poisson_ge(k, lam):
-    return clamp(1 - poisson_cdf(k - 1, lam), 0.0, 1.0)
+    return clamp(1-poisson_cdf(k-1, lam), 0, 1)
 
 
-def innings_to_decimal(value):
-    if value is None:
-        return None
-    text = str(value)
-    if "." not in text:
-        return safe_num(text)
-    try:
-        whole, frac = text.split(".", 1)
-        return int(whole) + int(frac[:1]) / 3
-    except Exception:
-        return None
+def game_cutoff(selected_date: date) -> date:
+    # Fundamental anti-leak rule: never use selected game's own data.
+    return selected_date - timedelta(days=1)
 
 
-# =========================================================
-# MLB API
-# =========================================================
+# ============================================================
+# MLB DATA
+# ============================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
 def pitcher_profile(player_id: int):
-    data = get_json(f"{MLB_PEOPLE_URL}/{player_id}")
-    people = data.get("people", [])
+    d = get_json(f"{MLB_PEOPLE_URL}/{player_id}")
+    people = d.get("people", [])
     return people[0] if people else {}
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def team_info(team_id: int, season: int):
+    d = get_json(f"{MLB_TEAMS_URL}/{team_id}", params={"season": season})
+    teams = d.get("teams", [])
+    return teams[0] if teams else {}
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def person_stats(player_id: int, season: int, group: str, sit_code: str | None = None):
-    params = {"stats": "season", "group": group, "season": season}
+def person_stats_to_date(player_id: int, season: int, group: str, end_date: str, sit_code: str | None = None):
+    params = {
+        "stats": "byDateRange",
+        "group": group,
+        "startDate": f"{season}-03-01",
+        "endDate": end_date,
+    }
     if sit_code:
         params["sitCodes"] = sit_code
-    data = get_json(f"{MLB_PEOPLE_URL}/{player_id}/stats", params=params)
-    groups = data.get("stats", [])
+    d = get_json(f"{MLB_PEOPLE_URL}/{player_id}/stats", params=params)
+    groups = d.get("stats", [])
     if not groups:
         return {}
     splits = groups[0].get("splits", [])
@@ -213,70 +249,87 @@ def person_stats(player_id: int, season: int, group: str, sit_code: str | None =
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def pitcher_season_stats(player_id: int, season: int):
-    stat = person_stats(player_id, season, "pitching")
+def pitcher_stats_to_date(player_id: int, season: int, end_date: str):
+    stat = person_stats_to_date(player_id, season, "pitching", end_date)
     so = safe_num(stat.get("strikeOuts"))
     bb = safe_num(stat.get("baseOnBalls"))
     bf = safe_num(stat.get("battersFaced"))
     gs = safe_num(stat.get("gamesStarted"))
-    ip = innings_to_decimal(stat.get("inningsPitched"))
+    ip = innings_decimal(stat.get("inningsPitched"))
 
-    stat["calc_k_pct"] = so / bf * 100 if so is not None and bf else None
-    stat["calc_bb_pct"] = bb / bf * 100 if bb is not None and bf else None
+    stat["calc_k_pct"] = so/bf*100 if so is not None and bf else None
+    stat["calc_bb_pct"] = bb/bf*100 if bb is not None and bf else None
     stat["calc_k_minus_bb"] = (
         stat["calc_k_pct"] - stat["calc_bb_pct"]
         if stat["calc_k_pct"] is not None and stat["calc_bb_pct"] is not None else None
     )
-    stat["calc_bf_start"] = bf / gs if bf is not None and gs else None
-    stat["calc_ip_start"] = ip / gs if ip is not None and gs else None
-    stat["calc_k_start"] = so / gs if so is not None and gs else None
+    stat["calc_bf_start"] = bf/gs if bf is not None and gs else None
+    stat["calc_ip_start"] = ip/gs if ip is not None and gs else None
+    stat["calc_k_start"] = so/gs if so is not None and gs else None
     return stat
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def pitcher_game_log(player_id: int, season: int):
-    data = get_json(
+def pitcher_game_log_before(player_id: int, season: int, selected_date: str):
+    d = get_json(
         f"{MLB_PEOPLE_URL}/{player_id}/stats",
         params={"stats": "gameLog", "group": "pitching", "season": season},
     )
-    groups = data.get("stats", [])
+    groups = d.get("stats", [])
     if not groups:
         return []
 
+    cutoff = pd.Timestamp(selected_date)
     out = []
     for split in groups[0].get("splits", []):
-        stat = split.get("stat", {})
-        if not safe_num(stat.get("gamesStarted")):
+        try:
+            split_date = pd.Timestamp(split.get("date"))
+        except Exception:
+            continue
+        if split_date >= cutoff:
+            continue
+
+        s = split.get("stat", {})
+        if not safe_num(s.get("gamesStarted")):
             continue
         out.append({
             "Date": split.get("date", "N/A"),
             "Opp": split.get("opponent", {}).get("name", "N/A"),
-            "IP": stat.get("inningsPitched", "N/A"),
-            "K": stat.get("strikeOuts", "N/A"),
-            "BB": stat.get("baseOnBalls", "N/A"),
-            "ER": stat.get("earnedRuns", "N/A"),
-            "HR": stat.get("homeRuns", "N/A"),
-            "Pitches": stat.get("numberOfPitches", "N/A"),
-            "BF": stat.get("battersFaced", "N/A"),
+            "IP": s.get("inningsPitched", "N/A"),
+            "K": s.get("strikeOuts", "N/A"),
+            "BB": s.get("baseOnBalls", "N/A"),
+            "ER": s.get("earnedRuns", "N/A"),
+            "HR": s.get("homeRuns", "N/A"),
+            "Pitches": s.get("numberOfPitches", "N/A"),
+            "BF": s.get("battersFaced", "N/A"),
         })
     return out[-10:][::-1]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def team_hitting_stats(team_id: int, season: int, sit_code: str | None = None):
-    params = {"stats": "season", "group": "hitting", "season": season}
+def team_hitting_to_date(team_id: int, season: int, end_date: str, sit_code: str | None = None):
+    params = {
+        "stats": "byDateRange",
+        "group": "hitting",
+        "startDate": f"{season}-03-01",
+        "endDate": end_date,
+    }
     if sit_code:
         params["sitCodes"] = sit_code
-    data = get_json(f"{MLB_TEAMS_URL}/{team_id}/stats", params=params)
-    groups = data.get("stats", [])
+
+    d = get_json(f"{MLB_TEAMS_URL}/{team_id}/stats", params=params)
+    groups = d.get("stats", [])
     if not groups:
         return {}
     splits = groups[0].get("splits", [])
     if not splits:
         return {}
     stat = splits[0].get("stat", {})
-    so, pa = safe_num(stat.get("strikeOuts")), safe_num(stat.get("plateAppearances"))
-    stat["calc_k_pct"] = so / pa * 100 if so is not None and pa else None
+    so = safe_num(stat.get("strikeOuts"))
+    bb = safe_num(stat.get("baseOnBalls"))
+    pa = safe_num(stat.get("plateAppearances"))
+    stat["calc_k_pct"] = so/pa*100 if so is not None and pa else None
+    stat["calc_bb_pct"] = bb/pa*100 if bb is not None and pa else None
     return stat
 
 
@@ -285,50 +338,52 @@ def game_time_label(raw):
         return "TBD"
     try:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return dt.astimezone(timezone.utc).strftime("%b %d \u00b7 %I:%M %p UTC").replace(" 0", " ")
-    except ValueError:
+        return dt.astimezone(timezone.utc).strftime("%b %d Â· %I:%M %p UTC").replace(" 0", " ")
+    except Exception:
         return "TBD"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def pitchers_for_date(selected_date: str):
-    data = get_json(
+    d = get_json(
         MLB_SCHEDULE_URL,
-        params={"sportId": 1, "date": selected_date, "hydrate": "probablePitcher,team,opponents,venue"},
+        params={
+            "sportId": 1, "date": selected_date,
+            "hydrate": "probablePitcher,team,opponents,venue",
+        },
     )
     options = []
-    for date_group in data.get("dates", []):
-        for game in date_group.get("games", []):
+    for dg in d.get("dates", []):
+        for game in dg.get("games", []):
             teams = game.get("teams", {})
             venue = game.get("venue", {})
-            for side, opp_side in (("away", "home"), ("home", "away")):
+            for side, opp_side in (("away","home"),("home","away")):
                 td, od = teams.get(side, {}), teams.get(opp_side, {})
                 probable = td.get("probablePitcher")
                 if not isinstance(probable, dict):
                     continue
-                pid, pname = probable.get("id"), probable.get("fullName")
-                if not pid or not pname:
+                pid, name = probable.get("id"), probable.get("fullName")
+                if not pid or not name:
                     continue
                 team, opp = td.get("team", {}), od.get("team", {})
                 try:
                     hand = pitcher_profile(int(pid)).get("pitchHand", {}).get("description", "N/A")
                 except Exception:
                     hand = "N/A"
-
                 options.append({
                     "selection_id": f"{game.get('gamePk')}-{side}-{pid}",
                     "game_pk": game.get("gamePk"),
                     "pitcher_id": int(pid),
-                    "pitcher_name": pname,
-                    "team": team.get("name", "N/A"),
+                    "pitcher_name": name,
+                    "team": team.get("name","N/A"),
                     "team_id": team.get("id"),
                     "team_side": side,
-                    "opponent": opp.get("name", "N/A"),
+                    "opponent": opp.get("name","N/A"),
                     "opponent_id": opp.get("id"),
                     "opponent_side": opp_side,
                     "throwing_hand": hand,
-                    "venue": venue.get("name", "N/A"),
-                    "status": game.get("status", {}).get("detailedState", "N/A"),
+                    "venue": venue.get("name","N/A"),
+                    "status": game.get("status", {}).get("detailedState","N/A"),
                     "game_time": game_time_label(game.get("gameDate")),
                 })
     return options
@@ -344,7 +399,7 @@ def game_context(feed):
     weather = gd.get("weather", {})
     officials = feed.get("liveData", {}).get("boxscore", {}).get("officials", [])
     umpire = next(
-        (r.get("official", {}).get("fullName") for r in officials if r.get("officialType") == "Home Plate"),
+        (x.get("official", {}).get("fullName") for x in officials if x.get("officialType") == "Home Plate"),
         None,
     )
     return {
@@ -359,25 +414,25 @@ def confirmed_lineup(feed, side):
     box = feed.get("liveData", {}).get("boxscore", {}).get("teams", {}).get(side, {})
     order = box.get("battingOrder", [])
     players = box.get("players", {})
-    result = []
+    rows = []
     for i, pid in enumerate(order, 1):
         p = players.get(f"ID{pid}", {})
         person = p.get("person", {})
-        result.append({
+        rows.append({
             "#": i,
             "player_id": int(pid),
             "Hitter": person.get("fullName", f"Player {pid}"),
-            "Bats": person.get("batSide", {}).get("code", "N/A"),
+            "Bats": person.get("batSide", {}).get("code","N/A"),
         })
-    return result
+    return rows
 
 
-# =========================================================
-# BASEBALL SAVANT / STATCAST
-# =========================================================
+# ============================================================
+# STATCAST ADVANCED METRICS
+# ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def statcast_data(player_id, start_dt, end_dt):
+def pitcher_statcast(player_id: int, start_dt: str, end_dt: str):
     try:
         df = statcast_pitcher(start_dt, end_dt, player_id)
         return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
@@ -385,1115 +440,1047 @@ def statcast_data(player_id, start_dt, end_dt):
         return pd.DataFrame()
 
 
-def statcast_metrics(df):
-    out = {
-        "whiff_pct": None, "csw_pct": None, "arsenal": [],
-        "vs_l": None, "vs_r": None, "home": None, "away": None,
-        "fastball_velo": None,
+@st.cache_data(ttl=3600, show_spinner=False)
+def team_statcast(team_abbr: str, start_dt: str, end_dt: str):
+    try:
+        df = statcast(start_dt, end_dt, team=team_abbr, verbose=False, parallel=True)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def offensive_team_rows(df: pd.DataFrame, team_abbr: str):
+    if df.empty or not {"home_team","away_team","inning_topbot"}.issubset(df.columns):
+        return pd.DataFrame()
+    home_offense = df["home_team"].astype(str).eq(team_abbr) & df["inning_topbot"].astype(str).str.lower().eq("bot")
+    away_offense = df["away_team"].astype(str).eq(team_abbr) & df["inning_topbot"].astype(str).str.lower().eq("top")
+    return df[home_offense | away_offense].copy()
+
+
+def plate_discipline(df: pd.DataFrame):
+    result = {
+        "Pitches": None, "SwStr%": None, "Whiff%": None, "CSW%": None,
+        "Contact%": None, "O-Contact%": None, "Z-Contact%": None,
+        "Chase%": None, "O-Swing%": None, "Swing%": None, "Zone%": None,
+        "Ball%": None,
     }
-    if df.empty:
+    if df.empty or "description" not in df.columns:
+        return result
+
+    d = df.copy()
+    desc = d["description"].astype(str)
+    swings = desc.isin(SWING_DESCRIPTIONS)
+    whiffs = desc.isin(WHIFF_DESCRIPTIONS)
+    contacts = desc.isin(CONTACT_DESCRIPTIONS)
+    called = desc.isin(CALLED_STRIKE_DESCRIPTIONS)
+    total = len(d)
+
+    if "zone" in d.columns:
+        zone_num = pd.to_numeric(d["zone"], errors="coerce")
+        in_zone = zone_num.between(1,9)
+        out_zone = zone_num.notna() & ~in_zone
+    else:
+        in_zone = pd.Series(False, index=d.index)
+        out_zone = pd.Series(False, index=d.index)
+
+    swing_n = swings.sum()
+    whiff_n = whiffs.sum()
+    contact_n = contacts.sum()
+    out_swings = (swings & out_zone).sum()
+    zone_swings = (swings & in_zone).sum()
+
+    result["Pitches"] = total
+    result["SwStr%"] = whiff_n/total*100 if total else None
+    result["Whiff%"] = whiff_n/swing_n*100 if swing_n else None
+    result["CSW%"] = (whiff_n + called.sum())/total*100 if total else None
+    result["Contact%"] = contact_n/swing_n*100 if swing_n else None
+    result["O-Contact%"] = (contacts & out_zone).sum()/out_swings*100 if out_swings else None
+    result["Z-Contact%"] = (contacts & in_zone).sum()/zone_swings*100 if zone_swings else None
+    result["O-Swing%"] = out_swings/out_zone.sum()*100 if out_zone.sum() else None
+    result["Chase%"] = result["O-Swing%"]
+    result["Swing%"] = swing_n/total*100 if total else None
+    result["Zone%"] = in_zone.sum()/(in_zone.sum()+out_zone.sum())*100 if (in_zone.sum()+out_zone.sum()) else None
+
+    ball_like = desc.isin({"ball","blocked_ball","pitchout"})
+    result["Ball%"] = ball_like.sum()/total*100 if total else None
+    return result
+
+
+def pa_rates(df: pd.DataFrame):
+    out = {"PA": None, "K%": None, "BB%": None, "K-BB%": None}
+    if df.empty or "events" not in df.columns:
         return out
-
-    desc = df["description"].astype(str) if "description" in df else pd.Series(index=df.index, dtype=str)
-    swings = {"swinging_strike","swinging_strike_blocked","foul","foul_tip","hit_into_play","foul_bunt","missed_bunt"}
-    whiffs = {"swinging_strike","swinging_strike_blocked","missed_bunt"}
-    swing_n = desc.isin(swings).sum()
-    whiff_n = desc.isin(whiffs).sum()
-    called_n = desc.eq("called_strike").sum()
-    out["whiff_pct"] = whiff_n / swing_n * 100 if swing_n else None
-    out["csw_pct"] = (whiff_n + called_n) / len(df) * 100 if len(df) else None
-
-    def k_rate(mask):
-        if "events" not in df:
-            return None
-        pa = df[mask & df["events"].notna()]
-        if pa.empty:
-            return None
-        k = pa["events"].astype(str).str.contains("strikeout", case=False, na=False).sum()
-        return k / len(pa) * 100
-
-    if "stand" in df:
-        out["vs_l"] = k_rate(df["stand"].astype(str).eq("L"))
-        out["vs_r"] = k_rate(df["stand"].astype(str).eq("R"))
-
-    if {"inning_topbot","home_team","away_team"}.issubset(df.columns):
-        out["home"] = k_rate(df["inning_topbot"].astype(str).str.lower().eq("top"))
-        out["away"] = k_rate(df["inning_topbot"].astype(str).str.lower().eq("bot"))
-
-    if "pitch_type" in df:
-        rows = []
-        for pitch, g in df.groupby("pitch_type"):
-            gd = g["description"].astype(str) if "description" in g else pd.Series(index=g.index, dtype=str)
-            sn, wn = gd.isin(swings).sum(), gd.isin(whiffs).sum()
-            velo = pd.to_numeric(g["release_speed"], errors="coerce").mean() if "release_speed" in g else None
-            rows.append({
-                "Pitch": PITCH_NAMES.get(str(pitch), str(pitch)),
-                "Code": str(pitch),
-                "Usage%": len(g) / len(df) * 100,
-                "Velo": float(velo) if pd.notna(velo) else None,
-                "Whiff%": wn / sn * 100 if sn else None,
-            })
-        rows.sort(key=lambda r: r["Usage%"], reverse=True)
-        out["arsenal"] = rows
-        for code in ("FF","SI","FC"):
-            row = next((r for r in rows if r["Code"] == code and r["Velo"] is not None), None)
-            if row:
-                out["fastball_velo"] = row["Velo"]
-                break
-
+    pa = df[df["events"].notna()].copy()
+    if pa.empty:
+        return out
+    e = pa["events"].astype(str)
+    k = e.str.contains("strikeout", case=False, na=False).sum()
+    bb = e.isin(["walk","intent_walk"]).sum()
+    n = len(pa)
+    out["PA"] = n
+    out["K%"] = k/n*100
+    out["BB%"] = bb/n*100
+    out["K-BB%"] = out["K%"] - out["BB%"]
     return out
 
 
+def arsenal_table(df: pd.DataFrame):
+    if df.empty or "pitch_type" not in df.columns:
+        return pd.DataFrame()
+
+    rows = []
+    for pitch, g in df.groupby("pitch_type"):
+        disc = plate_discipline(g)
+        pa = g[g["events"].notna()] if "events" in g.columns else pd.DataFrame()
+
+        pa_n = len(pa)
+        k_n = (
+            pa["events"].astype(str).str.contains("strikeout",case=False,na=False).sum()
+            if pa_n else 0
+        )
+        k_pct = k_n/pa_n*100 if pa_n else None
+
+        # PutAway: two-strike pitches that end in a strikeout / all two-strike pitches.
+        strikes = pd.to_numeric(g["strikes"], errors="coerce") if "strikes" in g.columns else pd.Series(index=g.index,dtype=float)
+        two_strike = strikes.eq(2)
+        k_event = (
+            g["events"].astype(str).str.contains("strikeout",case=False,na=False)
+            if "events" in g.columns else pd.Series(False,index=g.index)
+        )
+        putaway = (two_strike & k_event).sum()/two_strike.sum()*100 if two_strike.sum() else None
+
+        velo = pd.to_numeric(g["release_speed"],errors="coerce").mean() if "release_speed" in g.columns else None
+        spin = pd.to_numeric(g["release_spin_rate"],errors="coerce").mean() if "release_spin_rate" in g.columns else None
+        mov_x = pd.to_numeric(g["pfx_x"],errors="coerce").mean() if "pfx_x" in g.columns else None
+        mov_z = pd.to_numeric(g["pfx_z"],errors="coerce").mean() if "pfx_z" in g.columns else None
+        xwoba = pd.to_numeric(g["estimated_woba_using_speedangle"],errors="coerce").mean() if "estimated_woba_using_speedangle" in g.columns else None
+        drv = pd.to_numeric(g["delta_run_exp"],errors="coerce").sum() if "delta_run_exp" in g.columns else None
+        # Pitcher-positive run value: negative batter run expectancy change becomes positive.
+        run_value = -drv if drv is not None and pd.notna(drv) else None
+
+        rows.append({
+            "Pitch": PITCH_NAMES.get(str(pitch), str(pitch)),
+            "Code": str(pitch),
+            "Pitches": len(g),
+            "Usage%": len(g)/len(df)*100,
+            "Velo": velo,
+            "Spin": spin,
+            "Whiff%": disc["Whiff%"],
+            "K%": k_pct,
+            "PutAway%": putaway,
+            "xwOBA": xwoba,
+            "Run Value": run_value,
+            "pfx_x": mov_x,
+            "pfx_z": mov_z,
+        })
+    result = pd.DataFrame(rows)
+    return result.sort_values("Usage%",ascending=False) if not result.empty else result
+
+
+def opponent_pitch_type_table(team_offense: pd.DataFrame):
+    if team_offense.empty or "pitch_type" not in team_offense.columns:
+        return pd.DataFrame()
+
+    rows = []
+    for pitch, g in team_offense.groupby("pitch_type"):
+        disc = plate_discipline(g)
+        pa = g[g["events"].notna()] if "events" in g.columns else pd.DataFrame()
+        pa_rates_row = pa_rates(g)
+
+        ab_events = {"single","double","triple","home_run","field_out","force_out","grounded_into_double_play","field_error","fielders_choice","fielders_choice_out"}
+        ab = pa[pa["events"].astype(str).isin(ab_events)] if not pa.empty else pd.DataFrame()
+        hits = pa["events"].astype(str).isin(["single","double","triple","home_run"]).sum() if not pa.empty else 0
+        total_bases = 0
+        if not pa.empty:
+            ev = pa["events"].astype(str)
+            total_bases = ev.eq("single").sum()+2*ev.eq("double").sum()+3*ev.eq("triple").sum()+4*ev.eq("home_run").sum()
+
+        ba = hits/len(ab) if len(ab) else None
+        slg = total_bases/len(ab) if len(ab) else None
+
+        woba_val = pd.to_numeric(g["woba_value"],errors="coerce") if "woba_value" in g.columns else pd.Series(dtype=float)
+        woba_den = pd.to_numeric(g["woba_denom"],errors="coerce") if "woba_denom" in g.columns else pd.Series(dtype=float)
+        woba = woba_val.sum()/woba_den.sum() if len(woba_den) and woba_den.sum() else None
+
+        xba = pd.to_numeric(g["estimated_ba_using_speedangle"],errors="coerce").mean() if "estimated_ba_using_speedangle" in g.columns else None
+        xwoba = pd.to_numeric(g["estimated_woba_using_speedangle"],errors="coerce").mean() if "estimated_woba_using_speedangle" in g.columns else None
+
+        # xSLG is not a direct Statcast pitch-level field; leave explicit N/A.
+        launch = pd.to_numeric(g["launch_speed"],errors="coerce") if "launch_speed" in g.columns else pd.Series(dtype=float)
+        hardhit = (launch >= 95).sum()/launch.notna().sum()*100 if launch.notna().sum() else None
+
+        drv = pd.to_numeric(g["delta_run_exp"],errors="coerce").sum() if "delta_run_exp" in g.columns else None
+        rv100 = drv/len(g)*100 if drv is not None and len(g) else None
+
+        rows.append({
+            "Pitch": PITCH_NAMES.get(str(pitch),str(pitch)),
+            "Code": str(pitch),
+            "Pitches": len(g),
+            "PA": pa_rates_row["PA"],
+            "BA": ba,
+            "SLG": slg,
+            "wOBA": woba,
+            "Whiff%": disc["Whiff%"],
+            "K%": pa_rates_row["K%"],
+            "PutAway%": None,
+            "xBA": xba,
+            "xSLG": None,
+            "xwOBA": xwoba,
+            "HardHit%": hardhit,
+            "RV100": rv100,
+        })
+    result = pd.DataFrame(rows)
+    return result.sort_values("Pitches",ascending=False) if not result.empty else result
+
+
+def split_metrics(df: pd.DataFrame, side: str):
+    if df.empty or "stand" not in df.columns:
+        return {}
+    sub = df[df["stand"].astype(str).eq(side)]
+    return {**pa_rates(sub), **plate_discipline(sub)}
+
+
+def statcast_recent_games(df: pd.DataFrame, n=10):
+    if df.empty or "game_date" not in df.columns:
+        return pd.DataFrame()
+
+    rows = []
+    dates = pd.to_datetime(df["game_date"], errors="coerce")
+    d = df.assign(_date=dates)
+    unique_dates = sorted(d["_date"].dropna().dt.date.unique(), reverse=True)[:n]
+
+    for gd in unique_dates:
+        g = d[d["_date"].dt.date.eq(gd)]
+        pa = pa_rates(g)
+        disc = plate_discipline(g)
+        velo = pd.to_numeric(g["release_speed"],errors="coerce").mean() if "release_speed" in g.columns else None
+        spin = pd.to_numeric(g["release_spin_rate"],errors="coerce").mean() if "release_spin_rate" in g.columns else None
+        px = pd.to_numeric(g["pfx_x"],errors="coerce").mean() if "pfx_x" in g.columns else None
+        pz = pd.to_numeric(g["pfx_z"],errors="coerce").mean() if "pfx_z" in g.columns else None
+        usage = g["pitch_type"].value_counts(normalize=True).head(3).mul(100).to_dict() if "pitch_type" in g.columns else {}
+
+        rows.append({
+            "Date": str(gd),
+            "K%": pa["K%"],
+            "K-BB%": pa["K-BB%"],
+            "Whiff%": disc["Whiff%"],
+            "CSW%": disc["CSW%"],
+            "Ball%": disc["Ball%"],
+            "Velo": velo,
+            "Spin": spin,
+            "pfx_x": px,
+            "pfx_z": pz,
+            "Top Usage": ", ".join(f"{k} {v:.0f}%" for k,v in usage.items()),
+        })
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# PARK FACTOR
+# ============================================================
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def savant_park_factors(year: int):
-    """
-    Baseball Savant Statcast Park Factors.
-    We use the rolling 3-year SO factor for stability when available.
-    100 = neutral.
-    """
-    params = {
-        "type": "year",
-        "year": year,
-        "condition": "All",
-        "parks": "mlb",
-        "rolling": 3,
-        "stat": "index_wOBA",
-    }
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
-        ),
-        "Accept": "text/html,application/xhtml+xml",
-    }
-
+    params = {"type":"year","year":year,"condition":"All","parks":"mlb","rolling":3}
     try:
-        r = requests.get(SAVANT_PARK_URL, params=params, headers=headers, timeout=TIMEOUT)
+        r = requests.get(SAVANT_PARK_URL,params=params,headers={"User-Agent":"Mozilla/5.0"},timeout=TIMEOUT)
         r.raise_for_status()
-
-        # 1) pandas parser
-        try:
-            tables = pd.read_html(StringIO(r.text))
-        except Exception:
-            tables = []
-
-        for table in tables:
-            if isinstance(table.columns, pd.MultiIndex):
-                flat = []
-                for col in table.columns:
-                    parts = [str(x).strip() for x in col if str(x).strip() and str(x) != "nan"]
-                    flat.append(parts[-1] if parts else "")
-                table.columns = flat
+        tables = pd.read_html(StringIO(r.text))
+        for t in tables:
+            if isinstance(t.columns,pd.MultiIndex):
+                t.columns = [str(c[-1]).strip() for c in t.columns]
             else:
-                table.columns = [str(c).strip() for c in table.columns]
-
-            normalized = {normalize_name(c): c for c in table.columns}
-            venue_col = next((v for k, v in normalized.items() if k == "venue"), None)
-            so_col = next((v for k, v in normalized.items() if k in ("so", "strikeouts")), None)
-
-            if venue_col and so_col:
-                table = table.rename(columns={venue_col: "Venue", so_col: "SO"})
-                return table
-
-        # 2) tolerant BeautifulSoup row parser
-        soup = BeautifulSoup(r.text, "html.parser")
-        rows = soup.find_all("tr")
-        parsed = []
-        headers_found = None
-
-        for row in rows:
-            cells = [c.get_text(" ", strip=True) for c in row.find_all(["th", "td"])]
-            if not cells:
-                continue
-
-            normalized_cells = [normalize_name(c) for c in cells]
-            if "venue" in normalized_cells and "so" in normalized_cells:
-                headers_found = cells
-                continue
-
-            if headers_found and len(cells) >= len(headers_found):
-                parsed.append(cells[:len(headers_found)])
-
-        if headers_found and parsed:
-            df = pd.DataFrame(parsed, columns=headers_found)
-            normalized = {normalize_name(c): c for c in df.columns}
-            venue_col = next((v for k, v in normalized.items() if k == "venue"), None)
-            so_col = next((v for k, v in normalized.items() if k == "so"), None)
-            if venue_col and so_col:
-                return df.rename(columns={venue_col: "Venue", so_col: "SO"})
-
+                t.columns = [str(c).strip() for c in t.columns]
+            if "Venue" in t.columns and "SO" in t.columns:
+                return t
     except Exception:
         pass
-
     return pd.DataFrame()
 
 
-# Verified official Savant rolling-3 cache for venues we have explicitly checked.
-# This is only used when live Savant parsing fails; it is labeled as cached data.
-SAVANT_SO_VERIFIED_CACHE = {
-    (2026, "wrigley field"): 102.0,
-}
+SAVANT_SO_VERIFIED_CACHE = {(2026,"wrigley field"):102.0}
 
 
-def park_so_factor_with_source(venue: str, year: int):
-    df = savant_park_factors(year)
+def park_so_factor(venue, year):
     target = normalize_name(venue)
-
-    if not df.empty and "Venue" in df.columns and "SO" in df.columns:
-        venue_norm = df["Venue"].astype(str).map(normalize_name)
-        matches = df[venue_norm.eq(target)]
-        if matches.empty:
-            matches = df[venue_norm.map(lambda x: bool(x) and (target in x or x in target))]
-        if not matches.empty:
-            value = safe_num(matches.iloc[0].get("SO"))
-            if value is not None:
-                return value, "Savant live"
-
-    cached = SAVANT_SO_VERIFIED_CACHE.get((year, target))
+    df = savant_park_factors(year)
+    if not df.empty:
+        vn = df["Venue"].astype(str).map(normalize_name)
+        hit = df[vn.eq(target)]
+        if not hit.empty:
+            x = safe_num(hit.iloc[0].get("SO"))
+            if x is not None:
+                return x, "Savant live"
+    cached = SAVANT_SO_VERIFIED_CACHE.get((year,target))
     if cached is not None:
         return cached, "Savant verified cache"
-
     return None, "Unavailable"
 
-def park_so_factor(venue: str, year: int):
-    value, _ = park_so_factor_with_source(venue, year)
-    return value
 
+# ============================================================
+# FANGRAPHS / BASEBALL REFERENCE - VALIDATION ONLY
+# ============================================================
 
-# =========================================================
-# FANGRAPHS + BASEBALL REFERENCE
-# =========================================================
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def fangraphs_pitchers(season: int):
-    """
-    pybaseball season leaderboard backed by FanGraphs.
-    FanGraphs can occasionally return HTTP 403 to automated requests; we expose
-    that state instead of silently pretending the value exists.
-    """
+@st.cache_data(ttl=21600,show_spinner=False)
+def fangraphs_pitchers(season):
     try:
         try:
-            df = pitching_stats(season, season, qual=0)
+            df = pitching_stats(season,season,qual=0)
         except TypeError:
-            df = pitching_stats(season, season)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df, "OK"
-        return pd.DataFrame(), "EMPTY"
+            df = pitching_stats(season,season)
+        return (df,"OK") if isinstance(df,pd.DataFrame) and not df.empty else (pd.DataFrame(),"EMPTY")
     except Exception as exc:
-        msg = str(exc)
-        return pd.DataFrame(), ("BLOCKED_403" if "403" in msg else f"ERROR: {msg[:90]}")
+        return pd.DataFrame(), ("BLOCKED_403" if "403" in str(exc) else f"ERROR: {str(exc)[:70]}")
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def bref_pitchers(season: int):
+@st.cache_data(ttl=21600,show_spinner=False)
+def bref_pitchers(season):
     try:
         return pitching_stats_bref(season)
     except Exception:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def player_crosswalk(name: str):
-    """
-    Resolve MLBAM -> FanGraphs / Baseball-Reference identifiers via Chadwick data
-    exposed by pybaseball.
-    """
-    parts = str(name).strip().split()
-    if len(parts) < 2:
+@st.cache_data(ttl=86400,show_spinner=False)
+def player_crosswalk(name):
+    parts = str(name).split()
+    if len(parts)<2:
         return {}
-    first = " ".join(parts[:-1])
-    last = parts[-1]
     try:
-        df = playerid_lookup(last, first, fuzzy=True)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            # Prefer exact normalized full-name match when possible.
-            target = normalize_name(name)
-            for _, row in df.iterrows():
-                full = f"{row.get('name_first','')} {row.get('name_last','')}"
-                if normalize_name(full) == target:
-                    return row.to_dict()
-            return df.iloc[0].to_dict()
+        df = playerid_lookup(parts[-1]," ".join(parts[:-1]),fuzzy=True)
+        return df.iloc[0].to_dict() if isinstance(df,pd.DataFrame) and not df.empty else {}
     except Exception:
-        pass
-    return {}
+        return {}
 
 
-def match_pitcher_row(df: pd.DataFrame, name: str, mlbam_id: int | None = None, crosswalk: dict | None = None):
+def match_pitcher_row(df,name,mlbam_id=None,crosswalk=None):
     if df.empty:
         return {}
-
     crosswalk = crosswalk or {}
-
-    # Direct MLBAM columns (common for Baseball-Reference outputs).
-    if mlbam_id is not None:
-        for col in ("mlbID", "MLBAMID", "mlb_ID", "key_mlbam"):
+    for col in ("mlbID","MLBAMID","mlb_ID","key_mlbam"):
+        if col in df.columns and mlbam_id is not None:
+            ids = pd.to_numeric(df[col],errors="coerce")
+            hit = df[ids.eq(int(mlbam_id))]
+            if not hit.empty:
+                return hit.iloc[0].to_dict()
+    fgid = safe_num(crosswalk.get("key_fangraphs"))
+    if fgid is not None:
+        for col in ("IDfg","key_fangraphs"):
             if col in df.columns:
-                ids = pd.to_numeric(df[col], errors="coerce")
-                hit = df[ids.eq(int(mlbam_id))]
+                ids = pd.to_numeric(df[col],errors="coerce")
+                hit = df[ids.eq(int(fgid))]
                 if not hit.empty:
                     return hit.iloc[0].to_dict()
-
-    # FanGraphs ID match.
-    fg_id = safe_num(crosswalk.get("key_fangraphs"))
-    if fg_id is not None:
-        for col in ("IDfg", "key_fangraphs"):
-            if col in df.columns:
-                ids = pd.to_numeric(df[col], errors="coerce")
-                hit = df[ids.eq(int(fg_id))]
-                if not hit.empty:
-                    return hit.iloc[0].to_dict()
-
-    # Baseball-Reference ID match.
-    br_id = str(crosswalk.get("key_bbref") or "").strip()
-    if br_id:
-        for col in ("player_ID", "key_bbref"):
-            if col in df.columns:
-                hit = df[df[col].astype(str).str.strip().eq(br_id)]
-                if not hit.empty:
-                    return hit.iloc[0].to_dict()
-
-    # Exact normalized name.
-    name_col = next((c for c in ("Name", "NameASCII", "name_common") if c in df.columns), None)
+    name_col = next((c for c in ("Name","NameASCII","name_common") if c in df.columns),None)
     if name_col:
-        target = normalize_name(name)
-        hit = df[df[name_col].astype(str).map(normalize_name).eq(target)]
+        hit = df[df[name_col].astype(str).map(normalize_name).eq(normalize_name(name))]
         if not hit.empty:
             return hit.iloc[0].to_dict()
-
     return {}
 
 
-def source_validation(mlb, fg, br):
-    result = []
-    for label, row, mapping in (
-        ("MLB", mlb, {"ERA":"era","WHIP":"whip","K/9":"strikeoutsPer9Inn"}),
-        ("FanGraphs", fg, {"ERA":"ERA","WHIP":"WHIP","K/9":"K/9","FIP":"FIP","xFIP":"xFIP","SIERA":"SIERA","SwStr%":"SwStr%","CSW%":"CSW%"}),
-        ("Baseball-Reference", br, {"ERA":"ERA","WHIP":"WHIP","K/9":"SO9","SO/W":"SO/W"}),
-    ):
-        for stat_name, key in mapping.items():
-            value = row.get(key) if isinstance(row, dict) else None
-            if value is not None and str(value) != "nan":
-                result.append({"Source": label, "Stat": stat_name, "Value": value})
-    return pd.DataFrame(result)
-
-
-# =========================================================
+# ============================================================
 # LINEUP
-# =========================================================
+# ============================================================
 
-def hitter_k_profile(pid: int, season: int, pitcher_hand: str):
+def hitter_k_profile(pid,season,end_date,pitcher_hand):
     sit = "vl" if pitcher_hand.lower().startswith("left") else "vr"
-    stat = {}
-    source = "MLB split"
     try:
-        stat = person_stats(pid, season, "hitting", sit)
+        stat = person_stats_to_date(pid,season,"hitting",end_date,sit)
+        source = "MLB split"
     except Exception:
-        pass
+        stat,source = {},"N/A"
     if not stat:
-        source = "MLB season"
         try:
-            stat = person_stats(pid, season, "hitting")
+            stat = person_stats_to_date(pid,season,"hitting",end_date)
+            source = "MLB overall"
         except Exception:
             stat = {}
-    so, pa = safe_num(stat.get("strikeOuts")), safe_num(stat.get("plateAppearances"))
+    so,pa = safe_num(stat.get("strikeOuts")),safe_num(stat.get("plateAppearances"))
     return {
-        "K% vs hand": so / pa * 100 if so is not None and pa else None,
-        "PA": pa,
-        "Source": source if stat else "N/A",
+        "K% vs hand": so/pa*100 if so is not None and pa else None,
+        "PA": pa, "Contact%": None, "Whiff%": None, "Source": source if stat else "N/A",
     }
 
 
-def enrich_lineup(lineup, season, pitcher_hand):
-    out = []
-    for row in lineup:
-        out.append({**row, **hitter_k_profile(row["player_id"], season, pitcher_hand)})
-    return out
+def enrich_lineup(lineup,season,end_date,pitcher_hand):
+    return [{**r,**hitter_k_profile(r["player_id"],season,end_date,pitcher_hand)} for r in lineup]
 
 
 def lineup_k_pct(lineup):
     vals = [safe_num(r.get("K% vs hand")) for r in lineup]
     vals = [v for v in vals if v is not None]
-    return sum(vals) / len(vals) if vals else None
+    return sum(vals)/len(vals) if vals else None
 
 
-# =========================================================
-# RECENT FORM + MODEL
-# =========================================================
+# ============================================================
+# VOLUME / RECENT
+# ============================================================
 
 def recent_summary(log):
-    rows = log[:5]
+    rows = log[:10]
     if not rows:
         return {}
-    def avg(key):
-        vals = [safe_num(r.get(key)) for r in rows]
-        vals = [v for v in vals if v is not None]
-        return sum(vals)/len(vals) if vals else None
-    ips = [innings_to_decimal(r.get("IP")) for r in rows]
-    ips = [v for v in ips if v is not None]
-    pitches = [safe_num(r.get("Pitches")) for r in rows]
-    pitches = [v for v in pitches if v is not None]
+    def vals(key):
+        out = [safe_num(r.get(key)) for r in rows]
+        return [x for x in out if x is not None]
+    p = vals("Pitches"); bf = vals("BF"); k = vals("K")
+    ips = [innings_decimal(r.get("IP")) for r in rows]
+    ips = [x for x in ips if x is not None]
+
     return {
-        "avg_k": avg("K"),
-        "avg_bf": avg("BF"),
+        "avg_pitches": sum(p)/len(p) if p else None,
+        "max_pitches": max(p) if p else None,
+        "avg_bf": sum(bf)/len(bf) if bf else None,
+        "avg_k": sum(k)/len(k) if k else None,
         "avg_ip": sum(ips)/len(ips) if ips else None,
-        "avg_pitches": sum(pitches)/len(pitches) if pitches else None,
-        "max_pitches": max(pitches) if pitches else None,
+        "freq_90": sum(x>=90 for x in p)/len(p)*100 if p else None,
+        "freq_100": sum(x>=100 for x in p)/len(p)*100 if p else None,
+        "pitches_per_bf": (sum(p)/sum(bf)) if p and bf and sum(bf) else None,
     }
 
 
-def build_projection(mlb, fg, sm, team_general, team_split, lineup, recent, park_so, context):
-    # M1 ability: MLB + FanGraphs/Statcast validation
-    season_k = safe_num(mlb.get("calc_k_pct"))
-    fg_k = safe_num(fg.get("K%"))
-    if fg_k is not None and fg_k <= 1:
-        fg_k *= 100
+def days_rest(log, selected_date):
+    if not log:
+        return None
+    try:
+        prev = pd.Timestamp(log[0]["Date"]).date()
+        return (selected_date-prev).days
+    except Exception:
+        return None
 
-    ability_k = weighted_average([
-        (season_k, .55),
-        (fg_k, .25),
-        (sm.get("vs_l"), .10),
-        (sm.get("vs_r"), .10),
-    ], default=season_k or fg_k or 22.0)
 
-    # M2 leash
+# ============================================================
+# ACTION NETWORK PRO VALIDATION
+# ============================================================
+
+@st.cache_data(ttl=300,show_spinner=False)
+def action_public_status():
+    try:
+        r = requests.get(ACTION_PITCHING_PROPS_URL,headers={"User-Agent":"Mozilla/5.0"},timeout=TIMEOUT)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text,"html.parser")
+        text = soup.get_text(" ",strip=True)
+        if "Pitching" in text or "MLB" in text:
+            return "PAGE_OK"
+        return "PAGE_REACHED"
+    except Exception as exc:
+        return f"UNAVAILABLE: {str(exc)[:70]}"
+
+
+# ============================================================
+# PROJECTION
+# ============================================================
+
+def build_projection(mlb,pdisc,team_general,team_split,lineup,recent,park_so):
+    # Main weighted architecture:
+    # M1 20, M2 20, M3 10, M4 20, M5 15, M6 5, M7 5, M8 5
+    pitcher_k = safe_num(mlb.get("calc_k_pct"))
+    opp_k = safe_num(team_split.get("calc_k_pct")) or safe_num(team_general.get("calc_k_pct"))
+    lineup_k = lineup_k_pct(lineup)
+
+    base_k = weighted_average([
+        (pitcher_k,.50),
+        (opp_k,.30),
+        (lineup_k,.20),
+    ],default=pitcher_k or opp_k or 22.0)
+
+    whiff = safe_num(pdisc.get("Whiff%"))
+    csw = safe_num(pdisc.get("CSW%"))
+    contact = safe_num(pdisc.get("Contact%"))
+    chase = safe_num(pdisc.get("Chase%"))
+
+    ability_adj = 0.0
+    if whiff is not None: ability_adj += clamp((whiff-24)*.06,-.8,.8)
+    if csw is not None: ability_adj += clamp((csw-27)*.08,-.8,.8)
+    if contact is not None: ability_adj += clamp((76-contact)*.04,-.5,.5)
+    if chase is not None: ability_adj += clamp((chase-29)*.03,-.35,.35)
+
     bf = weighted_average([
-        (mlb.get("calc_bf_start"), .60),
-        (recent.get("avg_bf"), .40),
-    ], default=22.0)
-    bf = clamp(bf, 14, 32)
+        (mlb.get("calc_bf_start"),.60),
+        (recent.get("avg_bf"),.40),
+    ],default=22.0)
+    bf = clamp(bf,14,32)
 
-    # M4 opponent / M8 lineup
-    opp_general = safe_num(team_general.get("calc_k_pct"))
-    opp_split = safe_num(team_split.get("calc_k_pct"))
-    lineup_rate = lineup_k_pct(lineup)
-
-    matchup_k = weighted_average([
-        (ability_k, .40),
-        (opp_split, .25),
-        (lineup_rate, .20),
-        (opp_general, .15),
-    ], default=ability_k)
-
-    # M5 arsenal adjustment (conservative)
-    whiff = safe_num(sm.get("whiff_pct"))
-    csw = safe_num(sm.get("csw_pct"))
-    arsenal_adj = 0.0
-    if whiff is not None:
-        arsenal_adj += clamp((whiff - 24) * .08, -1.2, 1.2)
-    if csw is not None:
-        arsenal_adj += clamp((csw - 27) * .10, -1.0, 1.0)
-
-    # M6 recent form
-    recent_k = safe_num(recent.get("avg_k"))
     season_k_start = safe_num(mlb.get("calc_k_start"))
-    form_adj = clamp((recent_k - season_k_start) * .25, -.6, .6) if recent_k is not None and season_k_start is not None else 0.0
+    recent_k = safe_num(recent.get("avg_k"))
+    form_adj = clamp((recent_k-season_k_start)*.22,-.6,.6) if recent_k is not None and season_k_start is not None else 0
 
-    # M7 park factor: SO factor 100 = neutral. Keep bounded.
-    park_adj_pct = clamp(((park_so or 100) - 100) * .06, -1.2, 1.2)
+    park_adj = clamp(((park_so or 100)-100)*.05,-.8,.8)
 
-    # Weather / umpire shown but not scored until validated.
-    final_k_pct = clamp(matchup_k + arsenal_adj + park_adj_pct, 8, 45)
-    central = clamp(bf * final_k_pct / 100 + form_adj, .5, 14)
+    projected_k_pct = clamp(base_k+ability_adj+park_adj,8,45)
+    central = clamp(bf*projected_k_pct/100 + form_adj,.5,14)
+    sigma = max(1.35,math.sqrt(central)*.80)
 
-    sigma = max(1.35, math.sqrt(central) * .80)
     return {
-        "central": central,
-        "low": max(0, central - 1.35*sigma),
-        "high": central + 1.35*sigma,
-        "bf": bf,
-        "k_pct": final_k_pct,
-        "ability_k": ability_k,
-        "matchup_k": matchup_k,
-        "arsenal_adj": arsenal_adj,
-        "park_adj": park_adj_pct,
-        "form_adj": form_adj,
+        "central":central,
+        "low":max(0,central-1.35*sigma),
+        "high":central+1.35*sigma,
+        "bf":bf,
+        "k_pct":projected_k_pct,
+        "base_k":base_k,
+        "ability_adj":ability_adj,
+        "form_adj":form_adj,
+        "park_adj":park_adj,
     }
 
 
-def grade_bet(ev, edge_pp, completeness, lineup_ready=False, context_ready=False):
-    """
-    Conservative grading:
-    - A requires all 9 modules available.
-    - B requires at least 8/9.
-    - 7/9 or less is capped at C even with a large raw edge.
-    """
-    if ev is None or edge_pp is None:
+def grade_bet(ev,edge,modules):
+    if ev is None or edge is None:
         return "NO BET"
-
-    ev_pct = ev * 100
-
-    if completeness < (7/9):
+    if modules <= 6:
         return "PASS"
-
+    evp = ev*100
     raw = "PASS"
-    if ev_pct >= 10 and edge_pp >= 6:
-        raw = "A"
-    elif ev_pct >= 6 and edge_pp >= 4:
-        raw = "B"
-    elif ev_pct >= 3 and edge_pp >= 2:
-        raw = "C"
-
-    modules = round(completeness * 9)
-
-    if modules <= 7 and raw in ("A", "B"):
-        return "C"
-    if modules == 8 and raw == "A":
-        return "B"
-    if not lineup_ready and raw == "A":
-        return "B"
-    if not context_ready and raw == "A":
-        return "B"
-
+    if evp>=10 and edge>=6: raw="A"
+    elif evp>=6 and edge>=4: raw="B"
+    elif evp>=3 and edge>=2: raw="C"
+    if modules<=7 and raw in ("A","B"): return "C"
+    if modules==8 and raw=="A": return "B"
     return raw
 
 
-# =========================================================
-# ACTION NETWORK
-# =========================================================
+# ============================================================
+# TECHNICAL ANALYSIS
+# ============================================================
 
-ACTION_PITCHING_PROPS_URL = "https://www.actionnetwork.com/mlb/props/pitching"
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def action_network_public_props():
-    """
-    Best-effort public Action Network reader.
-    Authenticated PRO fields are never scraped or guessed.
-    """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
-        ),
-        "Accept": "text/html,application/xhtml+xml",
-    }
-
-    try:
-        r = requests.get(ACTION_PITCHING_PROPS_URL, headers=headers, timeout=TIMEOUT)
-        r.raise_for_status()
-
-        tables = []
-        try:
-            tables = pd.read_html(StringIO(r.text))
-        except Exception:
-            pass
-
-        cleaned = []
-        for table in tables:
-            if isinstance(table.columns, pd.MultiIndex):
-                table.columns = [
-                    " ".join(str(x).strip() for x in col if str(x).strip() and str(x) != "nan").strip()
-                    for col in table.columns
-                ]
-            else:
-                table.columns = [str(c).strip() for c in table.columns]
-            if not table.empty:
-                cleaned.append(table)
-
-        if cleaned:
-            return cleaned, "OK"
-
-        # If Action renders client-side, report page reachability separately.
-        soup = BeautifulSoup(r.text, "html.parser")
-        visible_text = soup.get_text(" ", strip=True)
-        if "MLB Pitching Prop Odds" in visible_text or "Pitching Props" in visible_text:
-            return [], "PAGE_OK_CLIENT_RENDERED"
-
-        return [], "PAGE_REACHED_NO_TABLE"
-
-    except Exception as exc:
-        return [], f"UNAVAILABLE: {str(exc)[:90]}"
-
-def action_pitcher_rows(tables, pitcher_name: str):
-    target = normalize_name(pitcher_name)
-    hits = []
-    for idx, table in enumerate(tables):
-        try:
-            mask = table.astype(str).apply(
-                lambda col: col.map(normalize_name).map(lambda x: target in x)
-            ).any(axis=1)
-            matched = table[mask]
-            if not matched.empty:
-                for _, row in matched.iterrows():
-                    data = {"Table": idx + 1}
-                    data.update({str(k): v for k, v in row.to_dict().items()})
-                    hits.append(data)
-        except Exception:
-            continue
-    return pd.DataFrame(hits)
+def direction(value, neutral, lower_good=False, band=1.0):
+    x = safe_num(value)
+    if x is None:
+        return "N/A"
+    delta = neutral-x if lower_good else x-neutral
+    if delta > band: return "POSITIVO"
+    if delta < -band: return "NEGATIVO"
+    return "NEUTRAL"
 
 
-def action_signal_score(action_projection, model_projection, bets_pct, money_pct, sharp_flag, line_move):
-    """
-    Action Network is a validation layer, not a hidden replacement for the model.
-    Returns a small informational score from -3 to +3.
-    """
-    score = 0.0
+def technical_analysis(mlb,pdisc,split_l,split_r,opp_disc,team_general,team_split,arsenal,recent,park_so,lineup,proj,manual):
+    items = []
 
-    ap = safe_num(action_projection)
-    mp = safe_num(model_projection)
-    if ap is not None and mp is not None:
-        diff = ap - mp
-        score += clamp(diff / 0.75, -1.0, 1.0)
+    k_pct = safe_num(mlb.get("calc_k_pct"))
+    whiff = safe_num(pdisc.get("Whiff%"))
+    csw = safe_num(pdisc.get("CSW%"))
+    contact = safe_num(pdisc.get("Contact%"))
+    m1 = direction(k_pct,22.5,False,1.5)
+    items.append(("M1 Â· Capacidad",m1,
+        f"K% {fmt(k_pct,1,'%')}, Whiff% {fmt(whiff,1,'%')}, CSW% {fmt(csw,1,'%')} y Contact% {fmt(contact,1,'%')}. "
+        "La combinaciÃ³n mide dominio real: ponches, swings fallidos y capacidad de evitar contacto."))
 
-    bp = safe_num(bets_pct)
-    mpct = safe_num(money_pct)
-    if bp is not None and mpct is not None:
-        # Money > bets can indicate larger average wager size on the selected side.
-        score += clamp((mpct - bp) / 20.0, -1.0, 1.0)
+    m2 = "POSITIVO" if safe_num(recent.get("avg_pitches")) and recent["avg_pitches"]>=90 else "NEUTRAL"
+    if manual.get("pitch_limit") or manual.get("injury_return") or manual.get("opener"):
+        m2 = "NEGATIVO"
+    items.append(("M2 Â· Volumen / Leash",m2,
+        f"BF proyectados {fmt(proj['bf'],1)}, pitches L10 {fmt(recent.get('avg_pitches'),1)}, "
+        f"90+ {fmt(recent.get('freq_90'),0,'%')}, 100+ {fmt(recent.get('freq_100'),0,'%')}. "
+        "El techo de K depende de cuÃ¡ntos bateadores realmente puede enfrentar."))
 
-    if sharp_flag:
-        score += 0.75
+    l = safe_num(split_l.get("K%")); r = safe_num(split_r.get("K%"))
+    m3 = "NEUTRAL"
+    if l is not None and r is not None and abs(l-r)>=5: m3="MATCHUP-DEPENDENT"
+    items.append(("M3 Â· Splits",m3,
+        f"K% vs LHB {fmt(l,1,'%')} y vs RHB {fmt(r,1,'%')}. "
+        "Una diferencia grande hace que la composiciÃ³n L/R/S del lineup tenga mÃ¡s importancia."))
 
-    lm = safe_num(line_move)
-    if lm is not None:
-        score += clamp(lm / 0.5, -0.75, 0.75)
+    ok = safe_num(team_split.get("calc_k_pct")) or safe_num(team_general.get("calc_k_pct"))
+    m4 = direction(ok,22.5,False,1.5)
+    items.append(("M4 Â· Rival",m4,
+        f"Opponent K% vs hand {fmt(ok,1,'%')}; Whiff% {fmt(opp_disc.get('Whiff%'),1,'%')}; "
+        f"Contact% {fmt(opp_disc.get('Contact%'),1,'%')}. Un rival con mÃ¡s K y menos contacto eleva oportunidades."))
 
-    return clamp(score, -3.0, 3.0)
+    top_pitch = arsenal.iloc[0]["Pitch"] if isinstance(arsenal,pd.DataFrame) and not arsenal.empty else "N/A"
+    top_whiff = arsenal.iloc[0]["Whiff%"] if isinstance(arsenal,pd.DataFrame) and not arsenal.empty else None
+    m5 = "POSITIVO" if safe_num(top_whiff) and safe_num(top_whiff)>=25 else "NEUTRAL"
+    items.append(("M5 Â· Arsenal",m5,
+        f"Lanzamiento principal: {top_pitch}, Whiff% {fmt(top_whiff,1,'%')}. "
+        "El mÃ³dulo compara las armas de mayor uso con cÃ³mo responde la ofensiva a esos tipos de pitcheo."))
+
+    m6 = "POSITIVO" if safe_num(recent.get("avg_k")) and safe_num(mlb.get("calc_k_start")) and recent["avg_k"]>mlb["calc_k_start"]+.5 else "NEUTRAL"
+    items.append(("M6 Â· Forma reciente",m6,
+        f"K L10 {fmt(recent.get('avg_k'),1)} vs K/start temporada {fmt(mlb.get('calc_k_start'),1)}. "
+        "Velocidad, spin, movimiento, uso y disciplina recientes sirven para detectar cambios reales."))
+
+    m7 = "POSITIVO" if safe_num(park_so) and park_so>101 else ("NEGATIVO" if safe_num(park_so) and park_so<99 else "NEUTRAL")
+    items.append(("M7 Â· Contexto",m7,
+        f"SO Park Factor {fmt(park_so,0)} (100 neutral). Clima y umpire se muestran, pero mantienen peso bajo hasta validaciÃ³n."))
+
+    lk = lineup_k_pct(lineup)
+    m8 = direction(lk,22.5,False,1.5) if lineup else "PENDIENTE"
+    items.append(("M8 Â· Lineup",m8,
+        f"Lineup K% agregado {fmt(lk,1,'%')}. El anÃ¡lisis definitivo mejora cuando los 9 bateadores confirmados estÃ¡n disponibles."))
+
+    return items
 
 
-# =========================================================
-# APP
-# =========================================================
+# ============================================================
+# APP LOAD
+# ============================================================
 
 st.markdown(
     """
-    <style>
-    .block-container {max-width: 1120px; padding-top: .75rem; padding-bottom: 4rem;}
-    h1,h2,h3 {letter-spacing:-.025em;}
-    .topbar {
-        padding: 18px 20px;
-        border: 1px solid rgba(128,128,128,.18);
-        border-radius: 22px;
-        background: linear-gradient(135deg, rgba(35,90,240,.16), rgba(120,80,220,.08));
-        margin-bottom: 14px;
-    }
-    .pitcher-card {
-        padding: 18px 20px;
-        border-radius: 22px;
-        border: 1px solid rgba(128,128,128,.20);
-        background: rgba(128,128,128,.045);
-        margin: 8px 0 14px 0;
-    }
-    .pill {
-        display:inline-block;
-        padding:5px 9px;
-        border-radius:999px;
-        background:rgba(128,128,128,.12);
-        margin-right:5px;
-        font-size:.78rem;
-    }
-    .best-card {
-        border-radius:22px;
-        padding:20px;
-        background: linear-gradient(145deg, rgba(30,115,255,.20), rgba(30,115,255,.06));
-        border: 1px solid rgba(30,115,255,.40);
-        margin: 12px 0;
-    }
-    .source-card {
-        border:1px solid rgba(128,128,128,.15);
-        border-radius:16px;
-        padding:12px 14px;
-        margin-bottom:8px;
-    }
-    div[data-testid="stMetric"] {
-        border: 1px solid rgba(128,128,128,.16);
-        border-radius: 16px;
-        padding: 12px;
-        background: rgba(128,128,128,.035);
-    }
-    div[data-testid="stTabs"] button {font-weight:650;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-    <div class="topbar">
-      <div style="font-size:.82rem;opacity:.7">MLB STARTING PITCHER STRIKEOUT MODEL</div>
-      <div style="font-size:2rem;font-weight:800;line-height:1.1">K Edge Dashboard</div>
-      <div style="font-size:.86rem;opacity:.72;margin-top:6px">
-        V1.4 \u00b7 MLB \u00b7 Savant \u00b7 Baseball-Reference \u00b7 FanGraphs fallback \u00b7 Action Network validation
-      </div>
+    <div class="hero">
+      <div style="font-size:.78rem;opacity:.68">MODELO PROFESIONAL MLB</div>
+      <div style="font-size:2rem;font-weight:850">Starting Pitcher Strikeout Lab</div>
+      <div style="opacity:.72;margin-top:5px">V2.0 LIVE TEST Â· Pregame-only data Â· Multi-line EV Â· Technical Analysis</div>
     </div>
-    """,
-    unsafe_allow_html=True,
+    """,unsafe_allow_html=True,
 )
 
-pick1, pick2 = st.columns([1, 2.3])
-with pick1:
-    game_date = st.date_input("Fecha", value=date.today(), min_value=date(2008, 1, 1))
+c1,c2 = st.columns([1,2.3])
+with c1:
+    game_date = st.date_input("Fecha",value=date.today(),min_value=date(2015,1,1))
 
 try:
     options = pitchers_for_date(game_date.isoformat())
 except Exception as exc:
-    st.error(f"No se pudo cargar el calendario MLB: {exc}")
+    st.error(f"No se pudo cargar MLB: {exc}")
     st.stop()
 
 if not options:
-    st.warning("MLB todav\u00eda no tiene abridores probables disponibles para esta fecha.")
+    st.warning("No hay abridores probables disponibles para esta fecha.")
     st.stop()
 
-by_id = {p["selection_id"]: p for p in options}
-with pick2:
-    selected_id = st.selectbox(
-        "Abridor",
-        list(by_id),
-        format_func=lambda x: (
-            f"{by_id[x]['pitcher_name']} \u00b7 "
-            f"{by_id[x]['team']} vs {by_id[x]['opponent']}"
-        ),
+by_id={x["selection_id"]:x for x in options}
+with c2:
+    selected=st.selectbox(
+        "Abridor",list(by_id),
+        format_func=lambda x:f"{by_id[x]['pitcher_name']} Â· {by_id[x]['team']} vs {by_id[x]['opponent']}"
     )
+p=by_id[selected]
 
-p = by_id[selected_id]
+cutoff = game_cutoff(game_date)
+cutoff_str = cutoff.isoformat()
 
 st.markdown(
     f"""
-    <div class="pitcher-card">
-      <div style="font-size:1.65rem;font-weight:800">{p['pitcher_name']}</div>
-      <div style="font-size:1.05rem;opacity:.65;margin-bottom:8px">vs {p['opponent']}</div>
-      <span class="pill">{p['team']}</span>
-      <span class="pill">{p['throwing_hand']}</span>
-      <span class="pill">{p['venue']}</span>
-      <span class="pill">{p['game_time']}</span>
+    <div class="gamecard">
+      <div style="font-size:1.6rem;font-weight:800">{p['pitcher_name']} <span style="opacity:.5">vs {p['opponent']}</span></div>
+      <span class="pill">{p['team']}</span><span class="pill">{p['throwing_hand']}</span>
+      <span class="pill">{p['venue']}</span><span class="pill">{p['game_time']}</span>
       <span class="pill">{p['status']}</span>
+      <div style="margin-top:9px;font-size:.8rem;opacity:.72">Pregame cutoff: datos hasta {cutoff_str}. El juego seleccionado nunca se usa en sus propios inputs.</div>
     </div>
-    """,
-    unsafe_allow_html=True,
+    """,unsafe_allow_html=True,
 )
 
-with st.spinner("Sincronizando fuentes..."):
-    try:
-        mlb = pitcher_season_stats(p["pitcher_id"], game_date.year)
-    except Exception:
-        mlb = {}
+with st.spinner("Cargando y cruzando fuentes pregame..."):
+    try: mlb = pitcher_stats_to_date(p["pitcher_id"],game_date.year,cutoff_str)
+    except Exception: mlb={}
+    try: log = pitcher_game_log_before(p["pitcher_id"],game_date.year,game_date.isoformat())
+    except Exception: log=[]
+
+    sit="vl" if p["throwing_hand"].lower().startswith("left") else "vr"
+    try: team_general=team_hitting_to_date(p["opponent_id"],game_date.year,cutoff_str)
+    except Exception: team_general={}
+    try: team_split=team_hitting_to_date(p["opponent_id"],game_date.year,cutoff_str,sit)
+    except Exception: team_split={}
+
+    try: feed=game_feed(p["game_pk"])
+    except Exception: feed={}
+    context=game_context(feed)
+
+    sc_start=f"{game_date.year}-03-01"
+    sc_pitcher=pitcher_statcast(p["pitcher_id"],sc_start,cutoff_str)
+    pdisc=plate_discipline(sc_pitcher)
+    split_l=split_metrics(sc_pitcher,"L")
+    split_r=split_metrics(sc_pitcher,"R")
+    arsenal=arsenal_table(sc_pitcher)
+    recent_sc=statcast_recent_games(sc_pitcher,10)
 
     try:
-        log = pitcher_game_log(p["pitcher_id"], game_date.year)
+        opp_info=team_info(p["opponent_id"],game_date.year)
+        opp_abbr=opp_info.get("abbreviation","")
     except Exception:
-        log = []
+        opp_abbr=""
 
-    try:
-        team_general = team_hitting_stats(p["opponent_id"], game_date.year)
-    except Exception:
-        team_general = {}
+    opp_sc_all=team_statcast(opp_abbr,sc_start,cutoff_str) if opp_abbr else pd.DataFrame()
+    opp_off=offensive_team_rows(opp_sc_all,opp_abbr) if opp_abbr else pd.DataFrame()
+    opp_disc=plate_discipline(opp_off)
+    opp_pitch=opponent_pitch_type_table(opp_off)
 
-    sit = "vl" if p["throwing_hand"].lower().startswith("left") else "vr"
-    try:
-        team_split = team_hitting_stats(p["opponent_id"], game_date.year, sit)
-    except Exception:
-        team_split = {}
+    park_so,park_source=park_so_factor(p["venue"],game_date.year)
 
-    try:
-        feed = game_feed(p["game_pk"])
-    except Exception:
-        feed = {}
+    raw_lineup=confirmed_lineup(feed,p["opponent_side"])
+    lineup=enrich_lineup(raw_lineup,game_date.year,cutoff_str,p["throwing_hand"]) if raw_lineup else []
 
-    sc_df = statcast_data(
-        p["pitcher_id"],
-        f"{game_date.year}-03-01",
-        game_date.isoformat(),
-    )
-    sm = statcast_metrics(sc_df)
+    recent=recent_summary(log)
+    rest_days=days_rest(log,game_date)
 
-    fg_df, fg_status = fangraphs_pitchers(game_date.year)
-    br_df = bref_pitchers(game_date.year)
-    crosswalk = player_crosswalk(p["pitcher_name"])
-    fg = match_pitcher_row(fg_df, p["pitcher_name"], p["pitcher_id"], crosswalk)
-    br = match_pitcher_row(br_df, p["pitcher_name"], p["pitcher_id"], crosswalk)
+    fg_df,fg_status=fangraphs_pitchers(game_date.year)
+    br_df=bref_pitchers(game_date.year)
+    cross=player_crosswalk(p["pitcher_name"])
+    fg=match_pitcher_row(fg_df,p["pitcher_name"],p["pitcher_id"],cross)
+    br=match_pitcher_row(br_df,p["pitcher_name"],p["pitcher_id"],cross)
 
-    park_so, park_so_source = park_so_factor_with_source(p["venue"], game_date.year)
-    context = game_context(feed)
+proj=build_projection(mlb,pdisc,team_general,team_split,lineup,recent,park_so)
 
-    lineup_raw = confirmed_lineup(feed, p["opponent_side"])
-    lineup = enrich_lineup(lineup_raw, game_date.year, p["throwing_hand"]) if lineup_raw else []
-    recent = recent_summary(log)
+# ============================================================
+# TABS
+# ============================================================
 
-proj = build_projection(
-    mlb, fg, sm, team_general, team_split, lineup, recent, park_so, context
+tab_summary,tab_modules,tab_analysis,tab_market,tab_sources=st.tabs(
+    ["Resumen","MÃ³dulos 1â8","AnÃ¡lisis TÃ©cnico","Mercado / Edge","Fuentes"]
 )
 
-# ------------------------------------------------------------------
-# MARKET INPUTS are shared across tabs
-# ------------------------------------------------------------------
-
-tab_summary, tab_modules, tab_market, tab_sources = st.tabs(
-    ["Resumen", "M\u00f3dulos", "Mercado", "Fuentes"]
-)
-
+# ------------------------------------------------------------
+# SUMMARY
+# ------------------------------------------------------------
 with tab_summary:
-    st.subheader("Proyecci\u00f3n")
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric("K proyectados", fmt(proj["central"], 2))
-    r2.metric("Rango probable", f"{proj['low']:.1f} \u2013 {proj['high']:.1f}")
-    r3.metric("Batters Faced", fmt(proj["bf"], 1))
-    r4.metric("K% proyectado", fmt(proj["k_pct"], 1, "%"))
+    a,b,c,d=st.columns(4)
+    a.metric("BF proyectados",fmt(proj["bf"],1))
+    b.metric("K% proyectado",fmt(proj["k_pct"],1,"%"))
+    c.metric("Strikeouts proyectados",fmt(proj["central"],2))
+    d.metric("Rango probable",f"{proj['low']:.1f}â{proj['high']:.1f}")
 
-    st.subheader("Snapshot")
-    q1, q2, q3, q4 = st.columns(4)
-    q1.metric("K%", fmt(mlb.get("calc_k_pct"), 1, "%"))
-    q2.metric("Whiff%", fmt(sm.get("whiff_pct"), 1, "%"))
-    q3.metric("Opponent K%", fmt(team_split.get("calc_k_pct") or team_general.get("calc_k_pct"), 1, "%"))
-    q4.metric("SO Park Factor", fmt(park_so, 0))
+    st.subheader("Probabilidad por umbral")
+    dist=[]
+    for k in range(3,11):
+        prob=poisson_ge(k,proj["central"])
+        dist.append({"LÃ­nea":f"{k}+","Probabilidad":prob*100,"Fair Odds":fair_american(prob)})
+    dist_df=pd.DataFrame(dist)
+    dist_df["Probabilidad"]=dist_df["Probabilidad"].round(1)
+    dist_df["Fair Odds"]=dist_df["Fair Odds"].round(0)
+    st.dataframe(dist_df,hide_index=True,use_container_width=True)
 
-    st.subheader("Distribuci\u00f3n")
-    dist = []
-    for k in range(4, 10):
-        prob = poisson_ge(k, proj["central"])
-        dist.append({
-            "K": f"{k}+",
-            "Probability": f"{prob*100:.1f}%",
-            "Fair Odds": f"{fair_american(prob):+.0f}",
-        })
-    st.dataframe(pd.DataFrame(dist), hide_index=True, use_container_width=True)
+    st.info("Esta es la proyecciÃ³n estadÃ­stica pregame. La selecciÃ³n de apuesta ocurre solamente despuÃ©s de comparar TODAS las lÃ­neas y precios disponibles.")
 
+# ------------------------------------------------------------
+# MODULES 1-8
+# ------------------------------------------------------------
 with tab_modules:
-    with st.expander("M1 \u00b7 Capacidad real de K \u2014 20%", expanded=True):
-        a,b,c,d = st.columns(4)
-        a.metric("K%", fmt(mlb.get("calc_k_pct"),1,"%"))
-        a.metric("K-BB%", fmt(mlb.get("calc_k_minus_bb"),1,"%"))
-        b.metric("K/9", mlb.get("strikeoutsPer9Inn","N/A"))
-        b.metric("WHIP", mlb.get("whip","N/A"))
-        c.metric("Whiff%", fmt(sm.get("whiff_pct"),1,"%"))
-        c.metric("CSW%", fmt(sm.get("csw_pct"),1,"%"))
-        d.metric("Fastball Velo", fmt(sm.get("fastball_velo"),1," mph"))
-        fg_k_display = (
-            safe_num(fg.get("K%"))*100
-            if safe_num(fg.get("K%")) is not None and safe_num(fg.get("K%")) <= 1
-            else fg.get("K%")
-        )
-        d.metric("FanGraphs K%", fmt(fg_k_display,1,"%"))
+    with st.expander("M1 Â· Capacidad real de strikeout â 20%",expanded=True):
+        a,b,c,d=st.columns(4)
+        a.metric("K%",fmt(mlb.get("calc_k_pct"),1,"%"))
+        a.metric("K/9",mlb.get("strikeoutsPer9Inn","N/A"))
+        a.metric("K-BB%",fmt(mlb.get("calc_k_minus_bb"),1,"%"))
+        a.metric("BB%",fmt(mlb.get("calc_bb_pct"),1,"%"))
+        b.metric("SwStr%",fmt(pdisc.get("SwStr%"),1,"%"))
+        b.metric("Whiff%",fmt(pdisc.get("Whiff%"),1,"%"))
+        b.metric("CSW%",fmt(pdisc.get("CSW%"),1,"%"))
+        b.metric("Contact%",fmt(pdisc.get("Contact%"),1,"%"))
+        c.metric("O-Contact%",fmt(pdisc.get("O-Contact%"),1,"%"))
+        c.metric("Z-Contact%",fmt(pdisc.get("Z-Contact%"),1,"%"))
+        c.metric("Chase / O-Swing%",fmt(pdisc.get("O-Swing%"),1,"%"))
+        c.metric("Zone%",fmt(pdisc.get("Zone%"),1,"%"))
+        d.metric("IP",mlb.get("inningsPitched","N/A"))
+        d.metric("BF",mlb.get("battersFaced","N/A"))
+        d.metric("Fastball Velo",fmt(
+            arsenal[arsenal["Code"].isin(["FF","SI","FC"])]["Velo"].dropna().iloc[0]
+            if not arsenal.empty and not arsenal[arsenal["Code"].isin(["FF","SI","FC"])]["Velo"].dropna().empty else None,
+            1," mph"
+        ))
+        d.metric("Sample pitches",fmt(pdisc.get("Pitches"),0))
 
-    with st.expander("M2 \u00b7 Volumen / Leash \u2014 20%"):
-        a,b,c,d = st.columns(4)
-        a.metric("GS", mlb.get("gamesStarted","N/A"))
-        a.metric("IP/start", fmt(mlb.get("calc_ip_start"),2))
-        b.metric("BF/start", fmt(mlb.get("calc_bf_start"),1))
-        b.metric("Avg BF L5", fmt(recent.get("avg_bf"),1))
-        c.metric("Avg Pitches L5", fmt(recent.get("avg_pitches"),1))
-        c.metric("Max Pitches L5", fmt(recent.get("max_pitches"),0))
-        d.metric("Avg K L5", fmt(recent.get("avg_k"),1))
-        d.metric("Avg IP L5", fmt(recent.get("avg_ip"),2))
-
-    with st.expander("M3 \u00b7 Splits \u2014 10%"):
-        a,b,c,d = st.columns(4)
-        a.metric("K% vs LHB", fmt(sm.get("vs_l"),1,"%"))
-        b.metric("K% vs RHB", fmt(sm.get("vs_r"),1,"%"))
-        c.metric("K% Home", fmt(sm.get("home"),1,"%"))
-        d.metric("K% Away", fmt(sm.get("away"),1,"%"))
-
-    with st.expander("M4 \u00b7 Propensi\u00f3n del rival \u2014 20%"):
-        a,b,c = st.columns(3)
-        a.metric("Opponent K%", fmt(team_general.get("calc_k_pct"),1,"%"))
-        b.metric("Opponent K% vs hand", fmt(team_split.get("calc_k_pct"),1,"%"))
-        c.metric("Confirmed lineup K%", fmt(lineup_k_pct(lineup),1,"%"))
-
-    with st.expander("M5 \u00b7 Arsenal vs Matchup \u2014 15%"):
-        if sm["arsenal"]:
-            arsenal = pd.DataFrame(sm["arsenal"])
-            for col in ("Usage%","Velo","Whiff%"):
-                arsenal[col] = pd.to_numeric(arsenal[col], errors="coerce").round(1)
-            st.dataframe(
-                arsenal[["Pitch","Usage%","Velo","Whiff%"]],
-                hide_index=True,
-                use_container_width=True,
-            )
-        else:
-            st.info("Statcast no devolvi\u00f3 arsenal.")
-
-    with st.expander("M6 \u00b7 Forma reciente \u2014 5%"):
+    with st.expander("M2 Â· Volumen / Leash â 20%"):
+        a,b,c,d=st.columns(4)
+        a.metric("IP/start",fmt(mlb.get("calc_ip_start"),2))
+        a.metric("BF/start",fmt(mlb.get("calc_bf_start"),1))
+        a.metric("K/start",fmt(mlb.get("calc_k_start"),1))
+        b.metric("Pitches L10",fmt(recent.get("avg_pitches"),1))
+        b.metric("Max pitches L10",fmt(recent.get("max_pitches"),0))
+        b.metric("90+ frequency",fmt(recent.get("freq_90"),0,"%"))
+        c.metric("100+ frequency",fmt(recent.get("freq_100"),0,"%"))
+        c.metric("Days rest",fmt(rest_days,0))
+        c.metric("Pitches/BF",fmt(recent.get("pitches_per_bf"),2))
+        d.metric("Avg BF L10",fmt(recent.get("avg_bf"),1))
+        d.metric("Avg IP L10",fmt(recent.get("avg_ip"),2))
+        d.metric("Avg K L10",fmt(recent.get("avg_k"),1))
         if log:
-            st.dataframe(pd.DataFrame(log[:5]), hide_index=True, use_container_width=True)
-        else:
-            st.info("Sin game log reciente.")
+            st.dataframe(pd.DataFrame(log),hide_index=True,use_container_width=True)
 
-    with st.expander("M7 \u00b7 Contexto \u2014 5%"):
-        a,b,c,d = st.columns(4)
-        a.metric("SO Park Factor", fmt(park_so,0))
-        a.caption(park_so_source)
-        b.metric("Temp", f"{context['temperature']}\u00b0F" if context.get("temperature") is not None else "N/A")
-        c.metric("Weather", context.get("condition") or "N/A")
-        d.metric("Umpire", context.get("umpire") or "N/A")
-        if park_so is None:
-            st.warning("Savant Park Factor no carg\u00f3; se trata como neutral.")
+        st.markdown("**Manual / news context**")
+        m21,m22,m23=st.columns(3)
+        with m21:
+            injury_return=st.checkbox("Regreso de lesiÃ³n")
+            pitch_limit=st.checkbox("Posible pitch limit")
+        with m22:
+            opener=st.checkbox("Opener / bulk pitcher")
+            manager_quick_hook=st.checkbox("Manager con hook corto esperado")
+        with m23:
+            manual_pitch_limit=st.number_input("Pitch limit estimado (0 = desconocido)",0,130,0,5)
+        leash_notes=st.text_area("Notas de leash / manager / lesiÃ³n",key="leash_notes")
 
-    with st.expander("M8 \u00b7 Lineup confirmado \u2014 5%"):
+    with st.expander("M3 Â· Splits del pitcher â 10%"):
+        split_df=pd.DataFrame([
+            {"Split":"vs RHB",**{k:split_r.get(k) for k in ("PA","K%","BB%","K-BB%","Whiff%","Contact%")}},
+            {"Split":"vs LHB",**{k:split_l.get(k) for k in ("PA","K%","BB%","K-BB%","Whiff%","Contact%")}},
+        ])
+        st.dataframe(split_df,hide_index=True,use_container_width=True)
         if lineup:
-            view = pd.DataFrame(lineup)
-            view["K% vs hand"] = pd.to_numeric(view["K% vs hand"], errors="coerce").round(1)
-            st.dataframe(
-                view[["#","Hitter","Bats","K% vs hand","PA","Source"]],
-                hide_index=True,
-                use_container_width=True,
-            )
+            counts=pd.Series([r.get("Bats","N/A") for r in lineup]).value_counts().to_dict()
+            st.write(f"**Lineup esperado/confirmado:** L {counts.get('L',0)} Â· R {counts.get('R',0)} Â· S {counts.get('S',0)}")
         else:
-            st.info("MLB todav\u00eda no public\u00f3 el batting order confirmado.")
+            st.info("ComposiciÃ³n final pendiente hasta que MLB publique lineup.")
 
+    with st.expander("M4 Â· Rival / propensiÃ³n a strikeout â 20%"):
+        a,b,c,d=st.columns(4)
+        a.metric("Team K%",fmt(team_general.get("calc_k_pct"),1,"%"))
+        a.metric("K% vs hand",fmt(team_split.get("calc_k_pct"),1,"%"))
+        a.metric("PA vs hand",team_split.get("plateAppearances","N/A"))
+        b.metric("BB%",fmt(team_split.get("calc_bb_pct") or team_general.get("calc_bb_pct"),1,"%"))
+        b.metric("Contact%",fmt(opp_disc.get("Contact%"),1,"%"))
+        b.metric("O-Contact%",fmt(opp_disc.get("O-Contact%"),1,"%"))
+        c.metric("Z-Contact%",fmt(opp_disc.get("Z-Contact%"),1,"%"))
+        c.metric("Whiff%",fmt(opp_disc.get("Whiff%"),1,"%"))
+        c.metric("Chase%",fmt(opp_disc.get("Chase%"),1,"%"))
+        d.metric("Swing%",fmt(opp_disc.get("Swing%"),1,"%"))
+        d.metric("Zone%",fmt(opp_disc.get("Zone%"),1,"%"))
+        d.metric("MLB Avg comparison","N/A")
+        st.caption("MLB-average comparison remains visible but N/A until a reliable current-season league plate-discipline feed is validated.")
+
+    with st.expander("M5 Â· Arsenal vs Matchup â 15%"):
+        st.markdown("**Pitcher arsenal**")
+        if not arsenal.empty:
+            view=arsenal[["Pitch","Pitches","Usage%","Velo","Spin","Whiff%","K%","PutAway%","xwOBA","Run Value"]].copy()
+            st.dataframe(view.round(3),hide_index=True,use_container_width=True)
+        else:
+            st.info("No arsenal Statcast.")
+
+        st.markdown("**Rival vs pitch type**")
+        if not opp_pitch.empty:
+            st.dataframe(
+                opp_pitch[["Pitch","Pitches","PA","BA","SLG","wOBA","Whiff%","K%","PutAway%","xBA","xSLG","xwOBA","HardHit%","RV100"]].round(3),
+                hide_index=True,use_container_width=True
+            )
+            st.caption("xSLG and opponent PutAway are displayed as N/A when Statcast does not provide a defensible direct calculation.")
+        else:
+            st.info("No se pudo construir el perfil de la ofensiva por tipo de pitcheo.")
+
+    with st.expander("M6 Â· Forma y cambios recientes â 5%"):
+        if not recent_sc.empty:
+            st.dataframe(recent_sc.round(2),hide_index=True,use_container_width=True)
+        else:
+            st.info("No recent Statcast trend table.")
+        st.caption("Incluye K%, K-BB%, Whiff%, CSW%, Ball%, velocidad, spin, movimiento y cambios de uso. xFIP/SIERA permanecen como cross-check de FanGraphs cuando la fuente responde.")
+
+    with st.expander("M7 Â· Contexto â 5%"):
+        a,b,c,d=st.columns(4)
+        a.metric("Local / Visitante","Home" if p["team_side"]=="home" else "Away")
+        a.metric("Stadium",p["venue"])
+        b.metric("SO Park Factor",fmt(park_so,0))
+        b.caption(park_source)
+        c.metric("Temperature",f"{context['temperature']}Â°F" if context.get("temperature") is not None else "N/A")
+        c.metric("Wind",context.get("wind") or "N/A")
+        d.metric("Umpire",context.get("umpire") or "N/A")
+        d.metric("Umpire K tendency","N/A")
+        st.caption("Weather and umpire stay low-weight until validation supports stronger use.")
+
+    with st.expander("M8 Â· Lineup confirmado â 5%"):
+        if lineup:
+            ldf=pd.DataFrame(lineup)
+            st.dataframe(ldf[["#","Hitter","Bats","K% vs hand","PA","Contact%","Whiff%","Source"]],hide_index=True,use_container_width=True)
+            high=[r["Hitter"] for r in lineup if safe_num(r.get("K% vs hand")) is not None and r["K% vs hand"]>=27]
+            low=[r["Hitter"] for r in lineup if safe_num(r.get("K% vs hand")) is not None and r["K% vs hand"]<=17]
+            st.write("**High-K hitters:** "+(", ".join(high) if high else "None flagged"))
+            st.write("**Low-K hitters:** "+(", ".join(low) if low else "None flagged"))
+        else:
+            st.warning("NO cerrar anÃ¡lisis definitivo: lineup real todavÃ­a no estÃ¡ confirmado.")
+        lineup_notes=st.text_area("Ausencias / sustituciones / diferencias vs lineup habitual",key="lineup_notes")
+
+# ------------------------------------------------------------
+# MARKET / ALL LINES
+# ------------------------------------------------------------
 with tab_market:
-    st.subheader("Sportsbooks")
-    st.caption("Compara DraftKings y FanDuel. Action Network se usa como capa adicional de validaci\u00f3n.")
+    st.subheader("M9 Â· TODAS las lÃ­neas disponibles")
+    st.caption("AÃ±ade solamente las lÃ­neas reales que tengas en DraftKings y FanDuel. El modelo evalÃºa cada precio y NO fuerza la lÃ­nea principal.")
 
-    books = {}
-    for book in ("DraftKings", "FanDuel"):
-        st.markdown(f"### {book}")
-        x,y,z = st.columns(3)
-        with x:
-            line = st.number_input(
-                f"{book} \u00b7 L\u00ednea K",
-                min_value=.5,
-                max_value=15.5,
-                value=5.5,
-                step=1.0,
-                key=f"{book}_line_v13",
-            )
-        with y:
-            over = st.number_input(
-                f"{book} \u00b7 Over",
-                min_value=-1000,
-                max_value=2000,
-                value=-110,
-                step=5,
-                key=f"{book}_over_v13",
-            )
-        with z:
-            under = st.number_input(
-                f"{book} \u00b7 Under",
-                min_value=-1000,
-                max_value=2000,
-                value=-110,
-                step=5,
-                key=f"{book}_under_v13",
-            )
-        books[book] = {"line": line, "over": over, "under": under}
+    default_market=pd.DataFrame([
+        {"Sportsbook":"DraftKings","Market":"Over","Line":4.5,"Odds":-110},
+        {"Sportsbook":"DraftKings","Market":"Under","Line":4.5,"Odds":-110},
+        {"Sportsbook":"DraftKings","Market":"Over","Line":5.5,"Odds":-110},
+        {"Sportsbook":"DraftKings","Market":"Under","Line":5.5,"Odds":-110},
+        {"Sportsbook":"FanDuel","Market":"Over","Line":4.5,"Odds":-110},
+        {"Sportsbook":"FanDuel","Market":"Under","Line":4.5,"Odds":-110},
+        {"Sportsbook":"FanDuel","Market":"Over","Line":5.5,"Odds":-110},
+        {"Sportsbook":"FanDuel","Market":"Under","Line":5.5,"Odds":-110},
+        {"Sportsbook":"DraftKings","Market":"Alt 4+","Line":4.0,"Odds":100},
+        {"Sportsbook":"FanDuel","Market":"Alt 5+","Line":5.0,"Odds":100},
+    ])
 
-    rows = []
-    for book, q in books.items():
-        line = q["line"]
-        over_threshold = math.floor(line) + 1
-        under_max = math.floor(line)
-        p_over = poisson_ge(over_threshold, proj["central"])
-        p_under = poisson_cdf(under_max, proj["central"])
+    market_input=st.data_editor(
+        default_market,num_rows="dynamic",hide_index=True,use_container_width=True,
+        column_config={
+            "Sportsbook":st.column_config.SelectboxColumn(options=["DraftKings","FanDuel"]),
+            "Market":st.column_config.TextColumn(help="Examples: Over, Under, Alt 4+, Alt 5+, Alt 6+"),
+            "Line":st.column_config.NumberColumn(step=.5),
+            "Odds":st.column_config.NumberColumn(step=5),
+        },
+        key="all_market_lines"
+    )
 
-        for side, prob, odds in (
-            ("OVER", p_over, q["over"]),
-            ("UNDER", p_under, q["under"]),
-        ):
-            implied = american_implied(odds)
-            edge = prob*100 - implied if implied is not None else None
-            ev = ev_per_dollar(prob, odds)
-            rows.append({
-                "Book": book,
-                "Side": side,
-                "Line": line,
-                "Odds": odds,
-                "Model%": prob*100,
-                "Fair": fair_american(prob),
-                "Edge pp": edge,
-                "EV%": ev*100 if ev is not None else None,
-            })
+    rows=[]
+    for _,r in market_input.iterrows():
+        book=str(r.get("Sportsbook",""))
+        market=str(r.get("Market","")).strip()
+        line=safe_num(r.get("Line")); odds=safe_num(r.get("Odds"))
+        if not book or not market or line is None or odds is None:
+            continue
 
-    market_df = pd.DataFrame(rows)
-    for col in ("Model%","Fair","Edge pp","EV%"):
-        market_df[col] = pd.to_numeric(market_df[col], errors="coerce").round(1)
+        low_market=market.lower()
+        if low_market.startswith("over"):
+            threshold=math.floor(line)+1
+            prob=poisson_ge(threshold,proj["central"])
+        elif low_market.startswith("under"):
+            maxk=math.floor(line)
+            prob=poisson_cdf(maxk,proj["central"])
+        elif "alt" in low_market or "+" in low_market:
+            # line itself is treated as the integer threshold for alt K+
+            threshold=int(round(line))
+            prob=poisson_ge(threshold,proj["central"])
+        else:
+            continue
 
-    st.dataframe(market_df, hide_index=True, use_container_width=True)
+        implied=american_implied(odds)
+        edge=prob*100-implied if implied is not None else None
+        ev=ev_per_dollar(prob,odds)
+        rows.append({
+            "Sportsbook":book,"Market":market,"Line":line,"Odds":int(odds),
+            "Model%":prob*100,"Implied%":implied,"Fair":fair_american(prob),
+            "Edge pp":edge,"EV%":ev*100 if ev is not None else None
+        })
+
+    market_df=pd.DataFrame(rows)
+    if not market_df.empty:
+        for col in ("Model%","Implied%","Fair","Edge pp","EV%"):
+            market_df[col]=pd.to_numeric(market_df[col],errors="coerce").round(1)
+        st.dataframe(market_df.sort_values("EV%",ascending=False),hide_index=True,use_container_width=True)
 
     st.divider()
-    st.subheader("Action Network")
+    st.subheader("Action Network PRO / B.A.R.T.O.L.O. validation")
+    st.markdown(f"[Abrir Action Network MLB Pitching Props]({ACTION_PITCHING_PROPS_URL})")
+    st.caption(f"Public page status: {action_public_status()}. PRO authentication remains manual/semi-manual.")
 
-    action_tables, action_status = action_network_public_props()
-    action_hits = action_pitcher_rows(action_tables, p["pitcher_name"])
+    ac1,ac2,ac3=st.columns(3)
+    with ac1:
+        bartolo_projection=st.number_input("B.A.R.T.O.L.O. projection K (0 = N/A)",0.0,15.0,0.0,.1)
+        bets_pct=st.number_input("Action % Bets",0,100,50,1)
+    with ac2:
+        money_pct=st.number_input("Action % Money",0,100,50,1)
+        sharp_action=st.checkbox("Sharp Action")
+    with ac3:
+        opening_line=st.number_input("Opening K line (0 = N/A)",0.0,15.5,0.0,.5)
+        current_line=st.number_input("Current K line (0 = N/A)",0.0,15.5,0.0,.5)
 
-    st.markdown(
-        f"[Abrir Action Network \u00b7 MLB Pitching Props]({ACTION_PITCHING_PROPS_URL})"
-    )
+    action_notes=st.text_area("Action PRO notes / screenshot transcription")
 
-    if not action_hits.empty:
-        st.success("Se encontr\u00f3 una referencia p\u00fablica para este pitcher en Action Network.")
-        st.dataframe(action_hits, hide_index=True, use_container_width=True)
+# ------------------------------------------------------------
+# ANALYSIS + FINAL CONCLUSION
+# ------------------------------------------------------------
+manual={
+    "injury_return":locals().get("injury_return",False),
+    "pitch_limit":locals().get("pitch_limit",False) or (locals().get("manual_pitch_limit",0)>0),
+    "opener":locals().get("opener",False),
+    "manager_quick_hook":locals().get("manager_quick_hook",False),
+}
+
+analysis_items=technical_analysis(
+    mlb,pdisc,split_l,split_r,opp_disc,team_general,team_split,
+    arsenal,recent,park_so,lineup,proj,manual
+)
+
+# Data completeness is based on actual model modules, not validation websites.
+status={
+    "M1":bool(mlb and not sc_pitcher.empty),
+    "M2":bool(mlb and log),
+    "M3":bool(not sc_pitcher.empty),
+    "M4":bool(team_general),
+    "M5":bool(not arsenal.empty),
+    "M6":bool(not recent_sc.empty),
+    "M7":bool(park_so is not None),
+    "M8":bool(lineup),
+    "M9":bool('market_df' in locals() and not market_df.empty),
+}
+modules=sum(status.values())
+
+best=None
+if 'market_df' in locals() and not market_df.empty:
+    eligible=market_df[pd.to_numeric(market_df["EV%"],errors="coerce").notna()]
+    if not eligible.empty:
+        best=eligible.sort_values("EV%",ascending=False).iloc[0].to_dict()
+
+with tab_analysis:
+    st.subheader("QuÃ© nos dicen los datos")
+    for title,signal,text in analysis_items:
+        st.markdown(
+            f"""<div class="analysis-card"><b>{title}</b> Â· <b>{signal}</b><br><span style="opacity:.78">{text}</span></div>""",
+            unsafe_allow_html=True,
+        )
+
+    st.subheader("Factores a favor / riesgos")
+    positives=[title for title,signal,_ in analysis_items if signal=="POSITIVO"]
+    negatives=[title for title,signal,_ in analysis_items if signal=="NEGATIVO"]
+    x1,x2=st.columns(2)
+    with x1:
+        st.success("**A favor:** "+(", ".join(positives) if positives else "No hay seÃ±ales fuertes aisladas."))
+    with x2:
+        risk_text=(", ".join(negatives) if negatives else "No hay seÃ±ales negativas fuertes en mÃ³dulos automÃ¡ticos.")
+        if manual.get("pitch_limit"): risk_text += " Â· Pitch limit / leash concern."
+        if manual.get("injury_return"): risk_text += " Â· Injury return."
+        if manual.get("opener"): risk_text += " Â· Opener/bulk role."
+        st.warning("**Riesgos:** "+risk_text)
+
+    st.subheader("ConclusiÃ³n final")
+    conf="A" if modules==9 else ("B" if modules==8 else "C")
+    st.write(f"**Calidad del anÃ¡lisis:** {conf} Â· {modules}/9 mÃ³dulos completos")
+    st.write(f"**BF proyectados:** {proj['bf']:.1f}")
+    st.write(f"**K% proyectado:** {proj['k_pct']:.1f}%")
+    st.write(f"**Strikeouts proyectados:** {proj['central']:.2f}")
+    st.write(f"**Rango probable:** {proj['low']:.1f}â{proj['high']:.1f} K")
+
+    if best:
+        ev_val=safe_num(best.get("EV%"))/100 if safe_num(best.get("EV%")) is not None else None
+        edge_val=safe_num(best.get("Edge pp"))
+        grade=grade_bet(ev_val,edge_val,modules)
+        decision="PASS / NO BET"
+        if grade in ("A","B","C") and safe_num(best.get("EV%")) is not None and best["EV%"]>=3:
+            decision=f"{best['Market']} {best['Line']} Â· {best['Sportsbook']} {int(best['Odds']):+d}"
+
+        st.markdown(
+            f"""
+            <div class="finalcard">
+              <div style="font-size:.78rem;opacity:.7">DICTAMEN DEL MODELO</div>
+              <div style="font-size:1.7rem;font-weight:850;margin:5px 0">{decision}</div>
+              <div>
+                Model <b>{best['Model%']:.1f}%</b> Â· Fair <b>{best['Fair']:+.0f}</b> Â·
+                Edge <b>{best['Edge pp']:.1f} pp</b> Â· EV <b>{best['EV%']:.1f}%</b> Â·
+                Grade <b>{grade}</b>
+              </div>
+            </div>
+            """,unsafe_allow_html=True,
+        )
+
+        if bartolo_projection>0:
+            diff=proj["central"]-bartolo_projection
+            st.info(
+                f"B.A.R.T.O.L.O. comparison: Action {bartolo_projection:.1f} K vs model {proj['central']:.2f} K "
+                f"(difference {diff:+.2f} K). Se usa como validaciÃ³n externa, no como sustituto."
+            )
+
+        st.caption("Una calificaciÃ³n A NO obliga a apostar. Sin edge/EV suficiente = NO BET.")
     else:
-        st.caption(f"Lectura p\u00fablica: {action_status}. Los datos PRO se introducen abajo.")
+        st.warning("No hay lÃ­neas vÃ¡lidas cargadas. Dictamen: PASS hasta introducir precios reales.")
 
-    ax1, ax2, ax3 = st.columns(3)
-    with ax1:
-        action_projection = st.number_input(
-            "Action PRO \u00b7 Proyecci\u00f3n K",
-            min_value=0.0,
-            max_value=15.0,
-            value=0.0,
-            step=.1,
-            help="Pon 0 si Action PRO no muestra proyecci\u00f3n.",
-        )
-        action_bets = st.number_input(
-            "Action \u00b7 % Bets",
-            min_value=0,
-            max_value=100,
-            value=50,
-            step=1,
-        )
-    with ax2:
-        action_money = st.number_input(
-            "Action \u00b7 % Money",
-            min_value=0,
-            max_value=100,
-            value=50,
-            step=1,
-        )
-        sharp_flag = st.checkbox("Sharp Action detectado")
-    with ax3:
-        action_line_move = st.number_input(
-            "Movimiento de l\u00ednea hacia OVER (+) / UNDER (-)",
-            min_value=-3.0,
-            max_value=3.0,
-            value=0.0,
-            step=.5,
-        )
-        action_side = st.selectbox("Lado evaluado", ["OVER", "UNDER"])
+    st.progress(modules/9)
+    st.caption(" Â· ".join(f"{k} {'â' if v else 'â³'}" for k,v in status.items()))
 
-    action_projection_value = action_projection if action_projection > 0 else None
-    signal = action_signal_score(
-        action_projection_value,
-        proj["central"],
-        action_bets,
-        action_money,
-        sharp_flag,
-        action_line_move,
-    )
-
-    st.metric("Action validation score", f"{signal:+.2f}")
-    st.caption(
-        "Este score es una capa de validaci\u00f3n y NO reemplaza la proyecci\u00f3n estad\u00edstica del modelo."
-    )
-
-    # Best bet from DK/FD only
-    best = market_df.sort_values("EV%", ascending=False).iloc[0].to_dict()
-
-    status = {
-        "M1": bool(mlb and not sc_df.empty),
-        "M2": bool(mlb and log),
-        "M3": bool(not sc_df.empty),
-        "M4": bool(team_general),
-        "M5": bool(sm["arsenal"]),
-        "M6": bool(log),
-        "M7": park_so is not None,
-        "M8": bool(lineup),
-        "M9": True,
-    }
-    completeness = sum(status.values()) / 9
-    grade = grade_bet(
-        safe_num(best.get("EV%"))/100 if safe_num(best.get("EV%")) is not None else None,
-        safe_num(best.get("Edge pp")),
-        completeness,
-        lineup_ready=bool(lineup),
-        context_ready=bool(park_so is not None and context.get("umpire")),
-    )
-
-    module_count = sum(status.values())
-    confidence_label = (
-        "FULL" if module_count == 9
-        else "HIGH" if module_count == 8
-        else "LIMITED" if module_count == 7
-        else "INCOMPLETE"
-    )
-    st.caption(f"Confianza de datos: {confidence_label} \u00b7 {module_count}/9 m\u00f3dulos")
-
-    st.markdown(
-        f"""
-        <div class="best-card">
-          <div style="font-size:.78rem;opacity:.7">MEJOR PRECIO ACTUAL</div>
-          <div style="font-size:1.75rem;font-weight:850;margin:4px 0">
-            {best['Side']} {best['Line']} K \u00b7 {best['Book']} {int(best['Odds']):+d}
-          </div>
-          <div>
-            Modelo <b>{best['Model%']:.1f}%</b> \u00b7
-            Fair <b>{best['Fair']:+.0f}</b> \u00b7
-            Edge <b>{best['Edge pp']:.1f} pp</b> \u00b7
-            EV <b>{best['EV%']:.1f}%</b> \u00b7
-            Grade <b>{grade}</b>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if module_count < 9:
-        st.warning(
-            "La calificaci\u00f3n est\u00e1 penalizada por datos faltantes. "
-            "Grade A solo se permite con los 9 m\u00f3dulos disponibles."
-        )
-
+# ------------------------------------------------------------
+# SOURCES
+# ------------------------------------------------------------
 with tab_sources:
-    st.subheader("Estado de fuentes")
+    st.subheader("Fuentes y estado")
+    src=pd.DataFrame([
+        {"Fuente":"MLB Stats API","Uso":"Schedule, probables, season-to-date, logs, lineup, weather, umpire","Estado":"OK" if mlb else "Partial"},
+        {"Fuente":"Baseball Savant / Statcast","Uso":"Plate discipline, arsenal, pitch movement, spin, pitch-type matchup","Estado":"OK" if not sc_pitcher.empty else "Unavailable"},
+        {"Fuente":"Savant SO Park Factor","Uso":"M7","Estado":f"{fmt(park_so,0)} Â· {park_source}"},
+        {"Fuente":"Baseball-Reference","Uso":"Validation cross-check","Estado":"OK" if br else "No match"},
+        {"Fuente":"FanGraphs","Uso":"Validation / xFIP / SIERA when reachable","Estado":fg_status},
+        {"Fuente":"Action Network PRO","Uso":"B.A.R.T.O.L.O., % Bets, % Money, sharp, movement","Estado":"Manual PRO validation"},
+        {"Fuente":"DraftKings / FanDuel","Uso":"Official model prices in current phase","Estado":"Manual line/odds entry"},
+    ])
+    st.dataframe(src,hide_index=True,use_container_width=True)
 
-    validation = source_validation(mlb, fg, br)
-
-    src1, src2 = st.columns(2)
-    with src1:
-        st.markdown(
-            f"""
-            <div class="source-card">
-              <b>MLB Stats API</b><br>
-              <span style="opacity:.7">Estado: {'OK' if mlb else 'Sin datos'}</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"""
-            <div class="source-card">
-              <b>Baseball Savant / Statcast</b><br>
-              <span style="opacity:.7">Estado: {'OK' if not sc_df.empty else 'Sin datos'}</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"""
-            <div class="source-card">
-              <b>Baseball-Reference</b><br>
-              <span style="opacity:.7">Estado: {'OK' if br else 'Sin coincidencia'}</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with src2:
-        st.markdown(
-            f"""
-            <div class="source-card">
-              <b>FanGraphs</b><br>
-              <span style="opacity:.7">Estado: {fg_status}</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"""
-            <div class="source-card">
-              <b>Savant SO Park Factor</b><br>
-              <span style="opacity:.7">Estado: {'OK \u00b7 '+fmt(park_so,0) if park_so is not None else 'No disponible'}</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"""
-            <div class="source-card">
-              <b>Action Network</b><br>
-              <span style="opacity:.7">Public props: {action_status}</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    if not validation.empty:
-        st.subheader("Cross-check estad\u00edstico")
-        st.dataframe(validation, hide_index=True, use_container_width=True)
-
-    st.info(
-        "FanGraphs puede bloquear solicitudes automatizadas con HTTP 403. "
-        "Cuando ocurre, el modelo contin\u00faa con MLB, Savant y Baseball-Reference sin inventar m\u00e9tricas."
+    st.warning(
+        "Important: FanGraphs/BBRef full-season leaderboards are validation only and are NOT fed into historical pregame projections, "
+        "preventing future-data leakage. Core projection inputs use cutoff-safe MLB + Statcast data."
     )
 
-st.caption("V1.4 \u00b7 Base estable para validaci\u00f3n y backtesting.")
+st.caption("V2.0 LIVE TEST Â· Structure frozen. Next phase: real-game logging, calibration and evidence-based adjustments.")
