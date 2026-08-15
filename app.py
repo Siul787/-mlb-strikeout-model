@@ -22,7 +22,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.1.4 LIVE TEST
+# V3.1.6 LIVE TEST
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -850,8 +850,9 @@ def opponent_pitch_type_table(team_offense: pd.DataFrame):
         launch = pd.to_numeric(g["launch_speed"],errors="coerce") if "launch_speed" in g.columns else pd.Series(dtype=float)
         hardhit = (launch >= 95).sum()/launch.notna().sum()*100 if launch.notna().sum() else None
 
-        drv = pd.to_numeric(g["delta_run_exp"],errors="coerce").sum() if "delta_run_exp" in g.columns else None
-        rv100 = drv/len(g)*100 if drv is not None and len(g) else None
+        drv_series = pd.to_numeric(g["delta_run_exp"],errors="coerce") if "delta_run_exp" in g.columns else pd.Series(dtype=float)
+        drv = drv_series.sum(min_count=1) if not drv_series.empty else None
+        rv100 = (drv/len(g)*100) if drv is not None and not pd.isna(drv) and len(g) else None
 
         rows.append({
             "Pitch": PITCH_NAMES.get(str(pitch),str(pitch)),
@@ -877,19 +878,51 @@ def opponent_pitch_type_table(team_offense: pd.DataFrame):
 
 
 PITCH_CANON = {
-    "ff":"ff","4 seam":"ff","4 seam fastball":"ff","four seam":"ff","four seam fastball":"ff",
-    "si":"si","sinker":"si",
+    "ff":"ff","4 seam":"ff","4 seamer":"ff","4 seam fastball":"ff","four seam":"ff","four seamer":"ff","four seam fastball":"ff","four seamer fastball":"ff",
+    "si":"si","sinker":"si","two seam":"si","2 seam":"si","two seamer":"si","2 seamer":"si",
     "sl":"sl","slider":"sl",
     "st":"st","sweeper":"st",
-    "fc":"fc","cutter":"fc",
-    "ch":"ch","change":"ch","changeup":"ch",
+    "fc":"fc","cutter":"fc","cut fastball":"fc",
+    "ch":"ch","change":"ch","change up":"ch","changeup":"ch",
     "cu":"cu","curve":"cu","curveball":"cu",
     "kc":"kc","knuckle curve":"kc","knuckle curveball":"kc",
-    "fs":"fs","splitter":"fs","split finger":"fs","split fingered":"fs",
-    "sv":"sv","slurve":"sv"
+    "fs":"fs","splitter":"fs","split finger":"fs","split fingered":"fs","split finger fastball":"fs",
+    "fo":"fo","forkball":"fo",
+    "sv":"sv","slurve":"sv",
+    "kn":"kn","knuckleball":"kn"
 }
 def canonical_pitch(v):
-    return PITCH_CANON.get(normalize_name(v), normalize_name(v))
+    n=normalize_name(v)
+    if n in PITCH_CANON:
+        return PITCH_CANON[n]
+    # Savant labels can vary (e.g. "4-Seamer", "Four-Seam Fastball").
+    tests=(
+        (("4 seam","4 seamer","four seam","four seamer"),"ff"),
+        (("sinker","two seam","2 seam"),"si"),
+        (("sweeper",),"st"),
+        (("slider",),"sl"),
+        (("cutter","cut fastball"),"fc"),
+        (("changeup","change up","change"),"ch"),
+        (("knuckle curve",),"kc"),
+        (("curveball","curve"),"cu"),
+        (("splitter","split finger"),"fs"),
+        (("forkball",),"fo"),
+        (("slurve",),"sv"),
+        (("knuckleball",),"kn"),
+    )
+    for needles,code in tests:
+        if any(x in n for x in needles):
+            return code
+    return n
+
+def pitch_expected_coverage(df: pd.DataFrame):
+    fields=("xBA","xSLG","xwOBA","RV100")
+    out={}
+    if not isinstance(df,pd.DataFrame) or df.empty:
+        return {f:0 for f in fields}
+    for f in fields:
+        out[f]=int(pd.to_numeric(df[f],errors="coerce").notna().sum()) if f in df.columns else 0
+    return out
 
 def merge_pitch_type_fallback(primary: pd.DataFrame, fallback: pd.DataFrame):
     """
@@ -981,10 +1014,28 @@ def statcast_recent_games(df: pd.DataFrame, n=10):
 # ============================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def savant_park_factors(year: int):
-    params = {"type":"year","year":year,"condition":"All","parks":"mlb","rolling":3}
+def savant_park_factors(year: int, rolling: int = 3):
+    # Baseball Savant Park Factors. B.A.R.T.O.L.O. uses a 3-year rolling view,
+    # so that is our primary context too.
+    params = {
+        "type":"year",
+        "year":year,
+        "condition":"All",
+        "parks":"mlb",
+        "rolling":rolling,
+        "stat":"index_wOBA",
+        "batSide":"",
+    }
     try:
-        r = requests.get(SAVANT_PARK_URL,params=params,headers={"User-Agent":"Mozilla/5.0"},timeout=TIMEOUT)
+        r = requests.get(
+            SAVANT_PARK_URL,
+            params=params,
+            headers={
+                "User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
+                "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            timeout=TIMEOUT,
+        )
         r.raise_for_status()
         tables = pd.read_html(StringIO(r.text))
         for t in tables:
@@ -992,14 +1043,23 @@ def savant_park_factors(year: int):
                 t.columns = [str(c[-1]).strip() for c in t.columns]
             else:
                 t.columns = [str(c).strip() for c in t.columns]
-            if "Venue" in t.columns and "SO" in t.columns:
+            norm={normalize_name(c):c for c in t.columns}
+            venue_col=next((norm[k] for k in norm if k in ("venue","park","stadium","name")),None)
+            so_col=next((norm[k] for k in norm if k in ("so","strikeout","strikeouts","k")),None)
+            if venue_col and so_col:
                 return t
     except Exception:
         pass
     return pd.DataFrame()
 
 
-SAVANT_SO_VERIFIED_CACHE = {(2026,"wrigley field"):102.0}
+# Verified Baseball Savant 3-year rolling SO factors.
+# These are used only when Savant's page cannot be parsed server-side.
+# 100 = neutral. Values are source-labelled in the UI instead of being invented.
+SAVANT_SO_VERIFIED_CACHE = {
+    (2026,"comerica park"):99.0,
+    (2026,"wrigley field"):102.0,
+}
 
 
 def park_so_factor(venue, year):
@@ -1010,26 +1070,32 @@ def park_so_factor(venue, year):
         "oracle park":["oracle park","oracle"],
         "rogers centre":["rogers centre","rogers center"],
         "rogers center":["rogers centre","rogers center"],
+        "uniqlo field at dodger stadium":["uniqlo field at dodger stadium","dodger stadium"],
+        "rate field":["rate field","guaranteed rate field"],
+        "daikin park":["daikin park","minute maid park"],
     }
     targets=set(aliases.get(target,[target]))
     targets.add(target)
 
-    df = savant_park_factors(year)
-    if not df.empty:
-        venue_col=next((c for c in df.columns if normalize_name(c) in ("venue","park","stadium","name")),None)
-        so_col=next((c for c in df.columns if normalize_name(c) in ("so","strikeout","strikeouts","k")),None)
-        if venue_col and so_col:
-            vn=df[venue_col].astype(str).map(normalize_name)
-            mask=vn.apply(lambda x:any(t in x or x in t for t in targets if t))
-            hit=df[mask]
-            if not hit.empty:
-                x=safe_num(hit.iloc[0].get(so_col))
-                if x is not None:
-                    return x,"Baseball Savant live"
+    # Primary: 3-year rolling, matching the contextual view used by Savant/BARTOLO.
+    for rolling in (3,1):
+        df = savant_park_factors(year, rolling=rolling)
+        if not df.empty:
+            venue_col=next((c for c in df.columns if normalize_name(c) in ("venue","park","stadium","name")),None)
+            so_col=next((c for c in df.columns if normalize_name(c) in ("so","strikeout","strikeouts","k")),None)
+            if venue_col and so_col:
+                vn=df[venue_col].astype(str).map(normalize_name)
+                mask=vn.apply(lambda x:any(t in x or x in t for t in targets if t))
+                hit=df[mask]
+                if not hit.empty:
+                    x=safe_num(hit.iloc[0].get(so_col))
+                    if x is not None:
+                        label="Baseball Savant live · 3Y rolling" if rolling==3 else "Baseball Savant live · current year"
+                        return x,label
 
     cached = SAVANT_SO_VERIFIED_CACHE.get((year,target))
     if cached is not None:
-        return cached, "Savant verified cache"
+        return cached, "Baseball Savant verified cache · 3Y rolling"
     return None, "SOURCE RETRY NEEDED"
 
 
@@ -1521,7 +1587,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.1.4 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
+      <div style="opacity:.70;margin-top:6px">V3.1.6 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -1688,11 +1754,21 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
                 opp_pitch = raw_pitch
                 opp_pitch_source="RAW_STATCAST_FALLBACK"
             else:
-                before_missing = int(opp_pitch.isna().sum().sum())
+                before_cov = pitch_expected_coverage(opp_pitch)
                 opp_pitch = merge_pitch_type_fallback(opp_pitch, raw_pitch)
-                after_missing = int(opp_pitch.isna().sum().sum())
-                if after_missing < before_missing:
+                after_cov = pitch_expected_coverage(opp_pitch)
+                if sum(after_cov.values()) > sum(before_cov.values()):
                     opp_pitch_source = f"{opp_pitch_source} + RAW_STATCAST_FILL"
+                # If a Savant naming variant still prevented a join, force a canonical
+                # code merge one more time using inferred pitch family codes.
+                if sum(after_cov.values()) == sum(before_cov.values()):
+                    p2=opp_pitch.copy(); r2=raw_pitch.copy()
+                    p2["Code"]=[canonical_pitch(x) for x in (p2["Code"] if "Code" in p2.columns else p2["Pitch"])]
+                    r2["Code"]=[canonical_pitch(x) for x in (r2["Code"] if "Code" in r2.columns else r2["Pitch"])]
+                    opp_pitch=merge_pitch_type_fallback(p2,r2)
+                    after2=pitch_expected_coverage(opp_pitch)
+                    if sum(after2.values()) > sum(after_cov.values()):
+                        opp_pitch_source=f"{opp_pitch_source} + RAW_STATCAST_ALIAS_FILL"
     except Exception:
         pass
 
@@ -1853,7 +1929,7 @@ with tab_modules:
         if not opp_pitch.empty:
             show_cols=[c for c in ["Pitch","Pitches","PA","BA","SLG","wOBA","Whiff%","K%","PutAway%","xBA","xSLG","xwOBA","HardHit%","RV100","Run Value"] if c in opp_pitch.columns]
             st.dataframe(clean_display_frame(opp_pitch[show_cols].round(3),"—"),hide_index=True,use_container_width=True)
-            st.caption(f"Fuente rival vs pitch type: {opp_pitch_source}. Expected stats se exigen antes de marcar M5 completo.")
+            st.caption(f"Fuente rival vs pitch type: {opp_pitch_source}. xBA/xSLG/xwOBA y RV100 se exigen antes de marcar M5 completo.")
         else:
             st.error("ERROR DE FUENTE: Savant no devolvió el perfil rival por tipo de pitcheo.")
 
@@ -2011,7 +2087,7 @@ analysis_items=technical_analysis(
 
 def pitch_matchup_quality(df):
     if not isinstance(df,pd.DataFrame) or df.empty:return False
-    required=["Whiff%","K%","xBA","xSLG","xwOBA"]
+    required=["Whiff%","K%","xBA","xSLG","xwOBA","RV100"]
     present=0
     for c in required:
         if c in df.columns and pd.to_numeric(df[c],errors="coerce").notna().any():
@@ -2146,4 +2222,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.1.4 LIVE TEST · Data-quality gate · expected-stat fallback · lineup handedness · cutoff-safe pregame model.")
+st.caption("V3.1.6 LIVE TEST · Savant SO Park Factor 3Y fallback · data-quality gate · cutoff-safe pregame model.")
