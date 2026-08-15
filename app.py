@@ -21,7 +21,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V2.3 LIVE TEST
+# V3.0 LIVE TEST
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -108,6 +108,19 @@ st.markdown(
     div[data-testid="stMetric"] label{color:var(--muted)!important}
     div[data-testid="stTabs"] button[aria-selected="true"]{color:#ff6d6d!important}
     .small-muted{color:var(--muted);font-size:.82rem}
+
+    .slate-header{display:flex;justify-content:space-between;align-items:end;gap:12px;margin:10px 0 14px}
+    .slate-count{font-size:.78rem;opacity:.58;font-weight:700}
+    .match-card{border:1px solid var(--border);border-radius:20px;padding:16px;margin-bottom:12px;background:linear-gradient(145deg,rgba(27,31,42,.94),rgba(17,19,26,.98));box-shadow:0 8px 26px rgba(0,0,0,.10)}
+    .match-top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:10px}
+    .match-title{font-size:1.02rem;font-weight:850}
+    .match-time{font-size:.78rem;opacity:.56;white-space:nowrap}
+    .pitcher-row{padding:10px 0;border-top:1px solid rgba(150,160,185,.10)}
+    .pitcher-name{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .pitcher-sub{font-size:.76rem;opacity:.58;margin-top:2px}
+    .mini-stat{display:inline-block;padding:3px 7px;border-radius:999px;margin-right:4px;margin-top:5px;font-size:.70rem;background:rgba(79,140,255,.10);border:1px solid rgba(79,140,255,.12)}
+    .state-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+    .dot-green{background:var(--green)} .dot-gold{background:var(--gold)}
     </style>
     """,
     unsafe_allow_html=True,
@@ -1238,56 +1251,141 @@ def technical_analysis(mlb,pdisc,split_l,split_r,opp_disc,team_general,team_spli
     return items
 
 
+
+def slate_games(options):
+    grouped={}
+    for opt in options:
+        grouped.setdefault(opt.get("game_pk"),[]).append(opt)
+    return list(grouped.values())
+
+@st.cache_data(ttl=300,show_spinner=False)
+def quick_pitcher_snapshot(player_id:int,season:int,cutoff_date:str):
+    try:
+        s=pitcher_stats_to_date(player_id,season,cutoff_date)
+    except Exception:
+        s={}
+    return {"K%":safe_num(s.get("calc_k_pct")),"K/start":safe_num(s.get("calc_k_start")),"BF/start":safe_num(s.get("calc_bf_start"))}
+
+def slate_status(option,selected_date):
+    snap=quick_pitcher_snapshot(option["pitcher_id"],selected_date.year,game_cutoff(selected_date).isoformat())
+    complete=all(snap.get(x) is not None for x in ("K%","K/start","BF/start"))
+    return ("LISTO","dot-green",snap) if complete else ("PARCIAL","dot-gold",snap)
+
 # ============================================================
 # APP LOAD
 # ============================================================
+
 
 st.markdown(
     """
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V2.3 LIVE TEST · Pregame data · Matchup intelligence · Multi-line EV</div>
+      <div style="opacity:.70;margin-top:6px">V3.0 LIVE TEST · Slate → Pitcher → Full Matchup Lab</div>
     </div>
-    """,unsafe_allow_html=True,
+    """, unsafe_allow_html=True
 )
 
-c1,c2 = st.columns([1,2.3])
-with c1:
-    game_date = st.date_input("Fecha",value=date.today(),min_value=date(2015,1,1))
+if "view_mode" not in st.session_state:
+    st.session_state["view_mode"]="slate"
+if "selected_pitcher_id" not in st.session_state:
+    st.session_state["selected_pitcher_id"]=None
+
+date_col,_=st.columns([1.15,2.0])
+with date_col:
+    game_date=st.date_input("Fecha",value=date.today(),min_value=date(2015,1,1),key="slate_date")
 
 try:
-    options = pitchers_for_date(game_date.isoformat())
+    options=pitchers_for_date(game_date.isoformat())
 except Exception as exc:
     st.error(f"No se pudo cargar MLB: {exc}")
     st.stop()
-
 if not options:
     st.warning("No hay abridores probables disponibles para esta fecha.")
     st.stop()
 
 by_id={x["selection_id"]:x for x in options}
-with c2:
-    selected=st.selectbox(
-        "Abridor",list(by_id),
-        format_func=lambda x:f"{by_id[x]['pitcher_name']} · {by_id[x]['team']} vs {by_id[x]['opponent']}"
+if st.session_state.get("selected_pitcher_id") not in by_id:
+    st.session_state["selected_pitcher_id"]=None
+    st.session_state["view_mode"]="slate"
+
+if st.session_state["view_mode"]=="slate":
+    games=slate_games(options)
+    st.markdown(
+        f"""
+        <div class="slate-header">
+          <div>
+            <div class="section-label">SLATE DEL DÍA</div>
+            <div style="font-size:1.4rem;font-weight:850">{game_date.strftime('%A · %B %d').upper()}</div>
+          </div>
+          <div class="slate-count">{len(games)} GAMES · {len(options)} PROBABLE STARTERS</div>
+        </div>
+        """, unsafe_allow_html=True
     )
-p=by_id[selected]
+    for game_opts in games:
+        first=game_opts[0]
+        teams=[]
+        for x in game_opts:
+            if x["team"] not in teams: teams.append(x["team"])
+        matchup=" @ ".join(teams[:2]) if len(teams)>=2 else first.get("team","GAME")
+        st.markdown(
+            f"""
+            <div class="match-card">
+              <div class="match-top">
+                <div><div class="match-title">{matchup}</div><div class="pitcher-sub">{first.get('venue','')}</div></div>
+                <div class="match-time">{first.get('game_time','TBD')}</div>
+              </div>
+            """, unsafe_allow_html=True
+        )
+        for opt in game_opts:
+            status_text,dot_class,snap=slate_status(opt,game_date)
+            ctext,cbutton=st.columns([3.2,1.0])
+            with ctext:
+                st.markdown(
+                    f"""
+                    <div class="pitcher-row">
+                      <div class="pitcher-name">{opt['pitcher_name']} <span style="opacity:.48">({opt['throwing_hand'][:1]})</span></div>
+                      <div class="pitcher-sub">vs {opt['opponent']}</div>
+                      <span class="mini-stat">K% {fmt(snap.get('K%'),1,'%')}</span>
+                      <span class="mini-stat">K/start {fmt(snap.get('K/start'),1)}</span>
+                      <span class="mini-stat">BF/start {fmt(snap.get('BF/start'),1)}</span>
+                      <div class="pitcher-sub" style="margin-top:6px"><span class="state-dot {dot_class}"></span>{status_text}</div>
+                    </div>
+                    """, unsafe_allow_html=True
+                )
+            with cbutton:
+                st.write("")
+                st.write("")
+                if st.button("ANALIZAR",key=f"open_{opt['selection_id']}",use_container_width=True):
+                    st.session_state["selected_pitcher_id"]=opt["selection_id"]
+                    st.session_state["view_mode"]="analysis"
+                    st.rerun()
+        st.markdown("</div>",unsafe_allow_html=True)
+    st.info("El slate no da picks. Selecciona un abridor para abrir su análisis M1–M9.")
+    st.stop()
 
-cutoff = game_cutoff(game_date)
-cutoff_str = cutoff.isoformat()
+selected_id=st.session_state["selected_pitcher_id"]
+p=by_id[selected_id]
+back_col,title_col=st.columns([.65,3.35])
+with back_col:
+    if st.button("← SLATE",use_container_width=True):
+        st.session_state["view_mode"]="slate"
+        st.rerun()
 
-st.markdown(
-    f"""
-    <div class="gamecard">
-      <div style="font-size:1.6rem;font-weight:800">{p['pitcher_name']} <span style="opacity:.5">vs {p['opponent']}</span></div>
-      <span class="pill">{p['team']}</span><span class="pill">{p['throwing_hand']}</span>
-      <span class="pill">{p['venue']}</span><span class="pill">{p['game_time']}</span>
-      <span class="pill">{p['status']}</span>
-      <div style="margin-top:9px;font-size:.8rem;opacity:.72">Pregame cutoff: datos hasta {cutoff_str}. El juego seleccionado nunca se usa en sus propios inputs.</div>
-    </div>
-    """,unsafe_allow_html=True,
-)
+cutoff=game_cutoff(game_date)
+cutoff_str=cutoff.isoformat()
+with title_col:
+    st.markdown(
+        f"""
+        <div class="gamecard">
+          <div class="section-label">MATCHUP LAB</div>
+          <div style="font-size:1.55rem;font-weight:850;margin-top:3px">{p['pitcher_name']} <span style="opacity:.48">vs {p['opponent']}</span></div>
+          <span class="pill">{p['team']}</span><span class="pill">{p['throwing_hand']}</span>
+          <span class="pill">{p['venue']}</span><span class="pill">{p['game_time']}</span><span class="pill">{p['status']}</span>
+          <div class="small-muted" style="margin-top:8px">Pregame cutoff: {cutoff_str} · el juego seleccionado nunca entra en sus propios inputs.</div>
+        </div>
+        """, unsafe_allow_html=True
+    )
 
 with st.spinner("Cargando y cruzando fuentes pregame..."):
     try: mlb = pitcher_stats_to_date(p["pitcher_id"],game_date.year,cutoff_str)
@@ -1356,7 +1454,7 @@ proj=build_projection(mlb,pdisc,team_general,team_split,lineup,recent,park_so)
 # ============================================================
 
 tab_summary,tab_modules,tab_analysis,tab_market,tab_sources=st.tabs(
-    ["Resumen","Módulos 1–8","Análisis Técnico","Mercado / Edge","Fuentes"]
+    ["Resumen","M1–M8","Análisis","Mercado","Fuentes"]
 )
 
 # ------------------------------------------------------------
@@ -1760,4 +1858,4 @@ with tab_sources:
         "preventing future-data leakage. Core projection inputs use cutoff-safe MLB + Statcast data."
     )
 
-st.caption("V2.3 LIVE TEST · Structure frozen. Next phase: real-game logging, calibration and evidence-based adjustments.")
+st.caption("V3.0 LIVE TEST · Structure frozen. Next phase: real-game logging, calibration and evidence-based adjustments.")
