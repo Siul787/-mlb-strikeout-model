@@ -2403,4 +2403,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.1.7 LIVE TEST · Savant detail CSV expected stats · full park-factor fallback · cutoff-safe pregame model.")
+st.caption("V3.2.0 LIVE TEST · Automatic Leash Intelligence · optional AI Analyst · cutoff-safe quantitative engine.")
