@@ -10,6 +10,11 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 from pybaseball import (
     statcast,
     statcast_pitcher,
@@ -22,7 +27,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.1.7 LIVE TEST
+# V3.2.1 LIVE VALIDATION
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -1420,6 +1425,271 @@ def lineup_k_pct(lineup):
     return sum(vals)/len(vals) if vals else None
 
 
+
+# ============================================================
+# AUTOMATIC LEASH INTELLIGENCE + OPTIONAL AI ANALYST
+# ============================================================
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def player_transactions(player_id:int, start_date:str, end_date:str):
+    try:
+        d=get_json(
+            "https://statsapi.mlb.com/api/v1/transactions",
+            params={"playerId":int(player_id),"startDate":start_date,"endDate":end_date},
+        )
+        out=[]
+        for t in d.get("transactions",[]) or []:
+            out.append({
+                "date":t.get("date") or t.get("effectiveDate"),
+                "type":t.get("typeDesc") or t.get("typeCode") or "",
+                "description":t.get("description") or "",
+            })
+        return out
+    except Exception:
+        return []
+
+
+def automatic_leash_intelligence(player_id:int, selected_date:date, log:list, recent:dict):
+    pitches=[safe_num(r.get("Pitches")) for r in (log or [])[:10]]
+    pitches=[x for x in pitches if x is not None]
+    ips=[innings_decimal(r.get("IP")) for r in (log or [])[:10]]
+    ips=[x for x in ips if x is not None]
+    bf=[safe_num(r.get("BF")) for r in (log or [])[:10]]
+    bf=[x for x in bf if x is not None]
+
+    l3=pitches[:3]
+    l5=pitches[:5]
+    avg3=sum(l3)/len(l3) if l3 else None
+    avg5=sum(l5)/len(l5) if l5 else None
+    avg10=sum(pitches)/len(pitches) if pitches else None
+    max5=max(l5) if l5 else None
+    under90=(sum(x<90 for x in pitches)/len(pitches)*100) if pitches else None
+
+    start=(selected_date-timedelta(days=120)).isoformat()
+    end=(selected_date-timedelta(days=1)).isoformat()
+    tx=player_transactions(player_id,start,end)
+    recent_activation=False
+    recent_il=False
+    for t in tx:
+        txt=f"{t.get('type','')} {t.get('description','')}".lower()
+        try:
+            dt=pd.Timestamp(t.get("date")).date()
+            age=(selected_date-dt).days
+        except Exception:
+            age=999
+        if age<=35 and any(x in txt for x in ("reinstated","activated","returned from injured","recalled from rehab")):
+            recent_activation=True
+        if age<=60 and any(x in txt for x in ("injured list","15-day il","60-day il","10-day il","rehab assignment")):
+            recent_il=True
+
+    gap_days=None
+    long_gap=False
+    if len(log)>=2:
+        try:
+            d0=pd.Timestamp(log[0]["Date"]).date()
+            d1=pd.Timestamp(log[1]["Date"]).date()
+            gap_days=(d0-d1).days
+            long_gap=gap_days>=18
+        except Exception:
+            pass
+
+    ramp=False
+    if len(l3)>=3:
+        seq=list(reversed(l3))
+        ramp=(seq[-1]-seq[0]>=8 and all(seq[i] <= seq[i+1]+2 for i in range(len(seq)-1)))
+
+    injury_return=bool(recent_activation and recent_il)
+
+    pitch_limit=False
+    if injury_return and max5 is not None and max5<90:
+        pitch_limit=True
+    elif long_gap and avg3 is not None and avg3<85:
+        pitch_limit=True
+    elif ramp and max5 is not None and max5<90:
+        pitch_limit=True
+
+    avg_ip=sum(ips[:5])/len(ips[:5]) if ips[:5] else None
+    avg_bf=sum(bf[:5])/len(bf[:5]) if bf[:5] else None
+    opener_bulk=bool((avg_ip is not None and avg_ip<3.6) or (avg_bf is not None and avg_bf<16.5))
+
+    quick_hook=bool(
+        len(pitches)>=5 and avg10 is not None and avg10<88 and
+        under90 is not None and under90>=60
+    )
+
+    ceiling=None
+    if pitches:
+        base=max(l5) if l5 else max(pitches)
+        if pitch_limit:
+            ceiling=round(min(max((pitches[0] if pitches else base)+8, base),92))
+        else:
+            ceiling=round(min(max(base,90),110))
+
+    role=("SHORT START / BULK RISK" if opener_bulk
+          else "STARTER · LEASH RESTRINGIDO" if pitch_limit
+          else "TRADITIONAL STARTER")
+    hook=("SHORT" if quick_hook else "LONG" if avg10 is not None and avg10>=94 else "NORMAL")
+    confidence=("HIGH" if len(pitches)>=8 else "MEDIUM" if len(pitches)>=5 else "LOW")
+
+    reasons=[]
+    if injury_return: reasons.append("IL/activation reciente detectada")
+    if long_gap and not injury_return: reasons.append(f"pausa de {gap_days} días detectada")
+    if ramp: reasons.append("ramp-up reciente de pitch count")
+    if pitch_limit: reasons.append("historial compatible con límite/restricción")
+    if opener_bulk: reasons.append("volumen reciente compatible con short-start/bulk")
+    if quick_hook: reasons.append("alta frecuencia de salidas antes de 90 pitches")
+    if not reasons: reasons.append("leash reciente estable")
+
+    return {
+        "injury_return":injury_return,
+        "pitch_limit":pitch_limit,
+        "opener":opener_bulk,
+        "manager_quick_hook":quick_hook,
+        "projected_pitch_ceiling":ceiling,
+        "role":role,
+        "hook":hook,
+        "confidence":confidence,
+        "avg_pitches_l3":avg3,
+        "avg_pitches_l5":avg5,
+        "under90_pct":under90,
+        "gap_days":gap_days,
+        "reason":" · ".join(reasons),
+        "transactions":tx,
+    }
+
+
+def apply_leash_adjustment(proj:dict, recent:dict, leash:dict):
+    out=dict(proj)
+    bf=safe_num(out.get("bf"))
+    if bf is None:
+        return out
+    factor=1.0
+    if leash.get("opener"):
+        factor=min(factor,.76)
+    elif leash.get("pitch_limit"):
+        ceiling=safe_num(leash.get("projected_pitch_ceiling"))
+        avgp=safe_num(recent.get("avg_pitches"))
+        if ceiling is not None and avgp is not None and avgp>0:
+            factor=min(factor,clamp(ceiling/avgp,.82,1.0))
+        else:
+            factor=min(factor,.90)
+    if leash.get("manager_quick_hook"):
+        factor=min(factor,.94)
+
+    if factor<.999:
+        old_bf=bf
+        out["bf"]=clamp(old_bf*factor,12,32)
+        k_pct=safe_num(out.get("k_pct")) or 22.0
+        form_adj=safe_num(out.get("form_adj")) or 0.0
+        out["central"]=clamp(out["bf"]*k_pct/100 + form_adj,.5,14)
+        sigma=max(1.35,math.sqrt(out["central"])*.80)
+        out["low"]=max(0,out["central"]-1.35*sigma)
+        out["high"]=out["central"]+1.35*sigma
+        out["leash_factor"]=factor
+        out["bf_pre_leash"]=old_bf
+    else:
+        out["leash_factor"]=1.0
+        out["bf_pre_leash"]=bf
+    return out
+
+
+def ai_api_key():
+    try:
+        return st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        return None
+
+
+def ai_status():
+    if OpenAI is None:
+        return "SDK NO INSTALADO"
+    return "IA CONECTADA" if ai_api_key() else "IA NO CONECTADA"
+
+
+def build_ai_payload(p,mlb,pdisc,split_l,split_r,team_general,team_split,opp_disc,
+                     arsenal,opp_pitch,recent,park_so,lineup,proj,leash,market_df):
+    top_arsenal=[]
+    if isinstance(arsenal,pd.DataFrame) and not arsenal.empty:
+        for _,r in arsenal.head(4).iterrows():
+            top_arsenal.append({
+                "pitch":r.get("Pitch"),"usage":safe_num(r.get("Usage%")),
+                "whiff":safe_num(r.get("Whiff%")),"k":safe_num(r.get("K%")),
+                "putaway":safe_num(r.get("PutAway%")),"xwoba":safe_num(r.get("xwOBA")),
+            })
+    matchup=[]
+    if isinstance(opp_pitch,pd.DataFrame) and not opp_pitch.empty:
+        for _,r in opp_pitch.head(8).iterrows():
+            matchup.append({
+                "pitch":r.get("Pitch"),"pitches":safe_num(r.get("Pitches")),
+                "whiff":safe_num(r.get("Whiff%")),"k":safe_num(r.get("K%")),
+                "xba":safe_num(r.get("xBA")),"xslg":safe_num(r.get("xSLG")),
+                "xwoba":safe_num(r.get("xwOBA")),"rv100":safe_num(r.get("RV100")),
+            })
+    hitters=[]
+    for r in (lineup or [])[:9]:
+        hitters.append({
+            "order":r.get("#"),"name":r.get("Hitter"),"bats":r.get("Bats"),
+            "k_vs_hand":safe_num(r.get("K% vs hand")),"pa":safe_num(r.get("PA")),
+            "contact":safe_num(r.get("Contact%")),"whiff":safe_num(r.get("Whiff%")),
+        })
+    markets=[]
+    if isinstance(market_df,pd.DataFrame) and not market_df.empty:
+        for _,r in market_df.head(12).iterrows():
+            markets.append({
+                "book":r.get("Sportsbook"),"market":r.get("Market"),"line":safe_num(r.get("Line")),
+                "odds":safe_num(r.get("Odds")),"model":safe_num(r.get("Model%")),
+                "implied":safe_num(r.get("Implied%")),"edge":safe_num(r.get("Edge pp")),
+                "ev":safe_num(r.get("EV%")),"l5":safe_num(r.get("Hit L5%")),"l10":safe_num(r.get("Hit L10%")),
+            })
+    return {
+        "pitcher":p.get("pitcher_name"),"team":p.get("team"),"opponent":p.get("opponent"),
+        "hand":p.get("throwing_hand"),"venue":p.get("venue"),
+        "M1":{
+            "K%":safe_num(mlb.get("calc_k_pct")),"K9":safe_num(mlb.get("strikeoutsPer9Inn")),
+            "K-BB%":safe_num(mlb.get("calc_k_minus_bb")),"Whiff%":safe_num(pdisc.get("Whiff%")),
+            "SwStr%":safe_num(pdisc.get("SwStr%")),"CSW%":safe_num(pdisc.get("CSW%")),
+            "Contact%":safe_num(pdisc.get("Contact%")),
+        },
+        "M2":{"recent":recent,"leash":leash},
+        "M3":{"vsL":split_l,"vsR":split_r},
+        "M4":{"teamK":safe_num(team_general.get("calc_k_pct")),
+              "teamKvsHand":safe_num(team_split.get("calc_k_pct")),"discipline":opp_disc},
+        "M5":{"arsenal":top_arsenal,"opponent_vs_pitch":matchup},
+        "M7":{"parkSO":park_so},
+        "M8":{"lineup":hitters},
+        "projection":{"BF":proj.get("bf"),"K%":proj.get("k_pct"),
+                      "Ks":proj.get("central"),"low":proj.get("low"),"high":proj.get("high")},
+        "M9":{"markets":markets},
+    }
+
+
+def run_ai_analyst(payload):
+    key=ai_api_key()
+    if OpenAI is None:
+        return None,"Instala el paquete openai en requirements.txt."
+    if not key:
+        return None,"Añade OPENAI_API_KEY en Streamlit Secrets para activar el Analista IA."
+
+    import json
+    client=OpenAI(api_key=key)
+    instructions=(
+        "Eres el Analista IA de un modelo MLB de strikeouts de pitcher abridor. "
+        "El motor cuantitativo ya calculó BF, K%, Ks, probabilidades, fair odds, edge y EV. "
+        "NO cambies esos números ni inventes datos. Analiza solamente la evidencia recibida. "
+        "Explica en español, en párrafos claros y específicos: "
+        "1) tesis del matchup, 2) qué datos la respaldan, 3) contradicciones entre módulos, "
+        "4) principales riesgos de fallo, 5) lectura del leash/volumen, "
+        "6) lectura arsenal-vs-rival, 7) lectura del lineup confirmado si existe, "
+        "8) lectura del mercado si hay líneas, 9) confianza analítica. "
+        "Si falta un dato dilo explícitamente. No recomiendes aumentar stake ni persigas pérdidas."
+    )
+    response=client.responses.create(
+        model="gpt-5.6",
+        instructions=instructions,
+        input=json.dumps(payload,ensure_ascii=False,default=str),
+    )
+    return response.output_text,None
+
 # ============================================================
 # VOLUME / RECENT
 # ============================================================
@@ -1747,7 +2017,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.1.7 LIVE TEST · Daily Board → Pitcher → Full Matchup Lab</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.1 LIVE VALIDATION · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -1968,6 +2238,7 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
 
     recent=recent_summary(log)
     rest_days=days_rest(log,game_date)
+    auto_leash=automatic_leash_intelligence(p["pitcher_id"],game_date,log,recent)
 
     fg_df,fg_status=fangraphs_pitchers(game_date.year)
     br_df=bref_pitchers(game_date.year)
@@ -1976,6 +2247,7 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
     br=match_pitcher_row(br_df,p["pitcher_name"],p["pitcher_id"],cross)
 
 proj=build_projection(mlb,pdisc,team_general,team_split,lineup,recent,park_so)
+proj=apply_leash_adjustment(proj,recent,auto_leash)
 
 # ============================================================
 # TABS
@@ -2051,17 +2323,25 @@ with tab_modules:
         if log:
             st.dataframe(pd.DataFrame(log),hide_index=True,use_container_width=True)
 
-        st.markdown("**Manual / news context**")
-        m21,m22,m23=st.columns(3)
-        with m21:
-            injury_return=st.checkbox("Regreso de lesión")
-            pitch_limit=st.checkbox("Posible pitch limit")
-        with m22:
-            opener=st.checkbox("Opener / bulk pitcher")
-            manager_quick_hook=st.checkbox("Manager con hook corto esperado")
-        with m23:
-            manual_pitch_limit=st.number_input("Pitch limit estimado (0 = desconocido)",0,130,0,5)
-        leash_notes=st.text_area("Notas de leash / manager / lesión",key="leash_notes")
+        st.markdown("**Leash Intelligence · automático**")
+        li1,li2,li3,li4=st.columns(4)
+        li1.metric("Injury return","YES" if auto_leash.get("injury_return") else "NO")
+        li1.metric("Role",auto_leash.get("role","N/A"))
+        li2.metric("Projected ceiling",fmt(auto_leash.get("projected_pitch_ceiling"),0," pitches"))
+        li2.metric("Pitch-limit risk","YES" if auto_leash.get("pitch_limit") else "NO")
+        li3.metric("Hook tendency",auto_leash.get("hook","N/A"))
+        li3.metric("<90 pitches",fmt(auto_leash.get("under90_pct"),0,"%"))
+        li4.metric("Inference confidence",auto_leash.get("confidence","N/A"))
+        li4.metric("L3 pitch avg",fmt(auto_leash.get("avg_pitches_l3"),1))
+        st.caption("Detección automática: "+auto_leash.get("reason",""))
+
+        with st.expander("Advanced override · solo si hay noticia oficial que el sistema no captó"):
+            override_injury=st.checkbox("Override: regreso de lesión",value=False)
+            override_pitch_limit=st.checkbox("Override: pitch limit oficial",value=False)
+            override_opener=st.checkbox("Override: opener / bulk",value=False)
+            override_hook=st.checkbox("Override: hook corto",value=False)
+            override_ceiling=st.number_input("Override pitch ceiling (0 = automático)",0,130,0,5)
+            override_notes=st.text_area("Fuente / nota oficial del override",key="override_leash_notes")
 
     with st.expander("M3 · Splits del pitcher — 10%"):
         split_df=pd.DataFrame([
@@ -2251,11 +2531,18 @@ with tab_market:
 # ------------------------------------------------------------
 # ANALYSIS + FINAL CONCLUSION
 # ------------------------------------------------------------
+if locals().get("override_ceiling",0)>0:
+    auto_leash["projected_pitch_ceiling"]=locals().get("override_ceiling")
+    auto_leash["pitch_limit"]=True
+    proj=apply_leash_adjustment(
+        build_projection(mlb,pdisc,team_general,team_split,lineup,recent,park_so),
+        recent,auto_leash
+    )
 manual={
-    "injury_return":locals().get("injury_return",False),
-    "pitch_limit":locals().get("pitch_limit",False) or (locals().get("manual_pitch_limit",0)>0),
-    "opener":locals().get("opener",False),
-    "manager_quick_hook":locals().get("manager_quick_hook",False),
+    "injury_return":bool(auto_leash.get("injury_return") or locals().get("override_injury",False)),
+    "pitch_limit":bool(auto_leash.get("pitch_limit") or locals().get("override_pitch_limit",False) or locals().get("override_ceiling",0)>0),
+    "opener":bool(auto_leash.get("opener") or locals().get("override_opener",False)),
+    "manager_quick_hook":bool(auto_leash.get("manager_quick_hook") or locals().get("override_hook",False)),
 }
 
 analysis_items=technical_analysis(
@@ -2295,6 +2582,33 @@ if 'market_df' in locals() and not market_df.empty:
         best=eligible.sort_values("EV%",ascending=False).iloc[0].to_dict()
 
 with tab_analysis:
+    st.subheader("Analista IA · lectura conjunta")
+    ai_state=ai_status()
+    state_icon="🟢" if ai_state=="IA CONECTADA" else "🟡"
+    st.markdown(f"**{state_icon} {ai_state}**")
+    st.caption("La IA interpreta M1–M9 y explica interacciones, contradicciones y riesgos. No cambia la matemática del motor.")
+
+    ai_payload=build_ai_payload(
+        p,mlb,pdisc,split_l,split_r,team_general,team_split,opp_disc,
+        arsenal,opp_pitch,recent,park_so,lineup,proj,auto_leash,
+        market_df if 'market_df' in locals() else pd.DataFrame()
+    )
+
+    ai_key=f"ai_analysis_{p['selection_id']}_{game_date.isoformat()}"
+    if ai_state=="IA CONECTADA":
+        if st.button("GENERAR ANÁLISIS IA",type="primary",key=f"run_{ai_key}"):
+            with st.spinner("La IA está leyendo M1–M9..."):
+                txt,err=run_ai_analyst(ai_payload)
+                if err:
+                    st.session_state[ai_key]=f"ERROR: {err}"
+                else:
+                    st.session_state[ai_key]=txt
+        if st.session_state.get(ai_key):
+            st.markdown(st.session_state[ai_key])
+    else:
+        st.info("El bloque ya está instalado. Para activarlo añade OPENAI_API_KEY en Streamlit Secrets. Mientras tanto el motor cuantitativo sigue funcionando completo.")
+
+    st.divider()
     st.subheader("Qué nos dicen los datos")
     for title,signal,text in analysis_items:
         sig=str(signal).upper()
@@ -2395,6 +2709,7 @@ with tab_sources:
         {"Fuente":"FanGraphs","Uso":"Validation / xFIP / SIERA when reachable","Estado":fg_status},
         {"Fuente":"Action Network PRO","Uso":"B.A.R.T.O.L.O., % Bets, % Money, sharp, movement","Estado":"Manual PRO validation"},
         {"Fuente":"DraftKings / FanDuel","Uso":"Official model prices in current phase","Estado":"Manual line/odds entry"},
+        {"Fuente":"OpenAI Responses API","Uso":"Analista IA explicativo; no modifica la proyección cuantitativa","Estado":ai_status()},
     ])
     st.dataframe(src,hide_index=True,use_container_width=True)
 
@@ -2403,4 +2718,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.0 LIVE TEST · Automatic Leash Intelligence · optional AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.1 LIVE VALIDATION · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
