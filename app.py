@@ -27,7 +27,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.2.2 LIVE VALIDATION
+# V3.2.3 LIVE VALIDATION
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -1477,14 +1477,50 @@ def hitter_k_profile(pid,season,end_date,pitcher_hand):
     }
 
 
-def enrich_lineup(lineup,season,end_date,pitcher_hand):
+def sample_size_label(pa):
+    p=safe_num(pa)
+    if p is None:return "NO SAMPLE"
+    if p<15:return "VERY SMALL"
+    if p<50:return "SMALL"
+    if p<100:return "MEDIUM"
+    return "STABLE"
+
+
+def shrink_k_pct(raw_k_pct, pa, prior_k_pct, prior_pa=60.0):
+    """
+    Empirical-Bayes style shrinkage for hitter K% vs handedness.
+    Tiny samples are pulled strongly toward the opponent-team K% vs that hand.
+    Large samples keep most of the hitter's observed rate.
+    """
+    raw=safe_num(raw_k_pct)
+    n=safe_num(pa)
+    prior=safe_num(prior_k_pct)
+    if prior is None:
+        prior=22.0
+    if raw is None or n is None or n<=0:
+        return prior
+    w=clamp(n/(n+float(prior_pa)),0.0,1.0)
+    return raw*w + prior*(1.0-w)
+
+
+def enrich_lineup(lineup,season,end_date,pitcher_hand,prior_k_pct=None):
     people=mlb_people_info([r.get("player_id") for r in lineup])
     out=[]
+    prior=safe_num(prior_k_pct)
+    if prior is None: prior=22.0
     for r in lineup:
         rr=dict(r); info=people.get(int(rr.get("player_id")),{}) if safe_num(rr.get("player_id")) is not None else {}
         if str(rr.get("Bats") or "").upper() not in ("L","R","S"):
             rr["Bats"]=info.get("Bats") or "N/A"
-        out.append({**rr,**hitter_k_profile(rr["player_id"],season,end_date,pitcher_hand)})
+        prof=hitter_k_profile(rr["player_id"],season,end_date,pitcher_hand)
+        raw=prof.get("K% vs hand")
+        pa=prof.get("PA")
+        adj=shrink_k_pct(raw,pa,prior,prior_pa=60.0)
+        prof["K% raw"]=raw
+        prof["K% adj"]=adj
+        prof["Sample"]=sample_size_label(pa)
+        prof["K% prior"]=prior
+        out.append({**rr,**prof})
     return out
 
 
@@ -1511,12 +1547,12 @@ def lineup_quality(lineup_rows):
     issues=[]
     if sum(1 for r in lineup_rows if str(r.get("Bats") or "").upper() in ("L","R","S"))<9:
         issues.append("handedness incompleto")
-    k_valid=sum(1 for r in lineup_rows if safe_num(r.get("K% vs hand")) is not None)
-    if k_valid<7:issues.append("K% vs hand insuficiente")
+    k_valid=sum(1 for r in lineup_rows if safe_num(r.get("K% adj")) is not None)
+    if k_valid<7:issues.append("K% ajustado insuficiente")
     return len(issues)==0,issues
 
 def lineup_k_pct(lineup):
-    vals = [safe_num(r.get("K% vs hand")) for r in lineup]
+    vals = [safe_num(r.get("K% adj")) for r in lineup]
     vals = [v for v in vals if v is not None]
     return sum(vals)/len(vals) if vals else None
 
@@ -1725,7 +1761,8 @@ def build_ai_payload(p,mlb,pdisc,split_l,split_r,team_general,team_split,opp_dis
     for r in (lineup or [])[:9]:
         hitters.append({
             "order":r.get("#"),"name":r.get("Hitter"),"bats":r.get("Bats"),
-            "k_vs_hand":safe_num(r.get("K% vs hand")),"pa":safe_num(r.get("PA")),
+            "k_vs_hand_raw":safe_num(r.get("K% raw")),"k_vs_hand_adj":safe_num(r.get("K% adj")),
+            "pa":safe_num(r.get("PA")),"sample":r.get("Sample"),
             "contact":safe_num(r.get("Contact%")),"whiff":safe_num(r.get("Whiff%")),
         })
     markets=[]
@@ -2071,11 +2108,13 @@ def technical_analysis(mlb,pdisc,split_l,split_r,opp_disc,team_general,team_spli
     lk=lineup_k_pct(lineup)
     if len(lineup)>=9:
         s8=direction(lk,22.0,False,1.2)
-        hi=[r["Hitter"] for r in lineup if safe_num(r.get("K% vs hand")) is not None and r["K% vs hand"]>=27]
-        lo=[r["Hitter"] for r in lineup if safe_num(r.get("K% vs hand")) is not None and r["K% vs hand"]<=17]
-        t8=(f"El lineup confirmado tiene {fmt(lk,1,'%')} K% agregado vs la mano del pitcher. "
-            f"High-K: {', '.join(hi) if hi else 'ninguno'}; low-K: {', '.join(lo) if lo else 'ninguno'}. "
-            "Este bloque reemplaza la aproximación del equipo por los nueve bateadores reales.")
+        hi=[r["Hitter"] for r in lineup if safe_num(r.get("K% adj")) is not None and r["K% adj"]>=27]
+        lo=[r["Hitter"] for r in lineup if safe_num(r.get("K% adj")) is not None and r["K% adj"]<=17]
+        small=[r["Hitter"] for r in lineup if str(r.get("Sample")) in ("VERY SMALL","SMALL")]
+        t8=(f"El lineup confirmado tiene {fmt(lk,1,'%')} K% agregado ajustado por tamaño de muestra. "
+            f"High-K ajustado: {', '.join(hi) if hi else 'ninguno'}; low-K ajustado: {', '.join(lo) if lo else 'ninguno'}. "
+            + (f"Muestras pequeñas protegidas: {', '.join(small)}. " if small else "")
+            + "Los K% individuales con pocos PA se encogen hacia el K% del equipo vs la mano del pitcher antes de entrar al motor.")
     else:
         s8="PENDIENTE";t8=("El lineup todavía no está confirmado. La proyección es PROVISIONAL porque los splits del pitcher "
                             "pueden cambiar materialmente según la composición L/R/S y los K% individuales de los nueve bateadores.")
@@ -2113,7 +2152,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.2 LIVE VALIDATION · Lineup Team Guard · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.3 LIVE VALIDATION · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2336,7 +2375,10 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
         game_date.year,
         game_date.isoformat(),
     )
-    lineup=enrich_lineup(raw_lineup,game_date.year,cutoff_str,p["throwing_hand"]) if raw_lineup else []
+    lineup=enrich_lineup(
+        raw_lineup,game_date.year,cutoff_str,p["throwing_hand"],
+        prior_k_pct=(safe_num(team_split.get("calc_k_pct")) or safe_num(team_general.get("calc_k_pct")) or 22.0)
+    ) if raw_lineup else []
 
     recent=recent_summary(log)
     rest_days=days_rest(log,game_date)
@@ -2524,11 +2566,20 @@ with tab_modules:
         if lineup:
             st.success(f"Lineup Team Guard: {lineup_guard_status}")
             ldf=pd.DataFrame(lineup)
-            st.dataframe(ldf[["#","Hitter","Bats","K% vs hand","PA","Contact%","Whiff%","Source"]],hide_index=True,use_container_width=True)
-            high=[r["Hitter"] for r in lineup if safe_num(r.get("K% vs hand")) is not None and r["K% vs hand"]>=27]
-            low=[r["Hitter"] for r in lineup if safe_num(r.get("K% vs hand")) is not None and r["K% vs hand"]<=17]
-            st.write("**High-K hitters:** "+(", ".join(high) if high else "None flagged"))
-            st.write("**Low-K hitters:** "+(", ".join(low) if low else "None flagged"))
+            show=ldf[["#","Hitter","Bats","K% raw","K% adj","PA","Sample","Contact%","Whiff%","Source"]].copy()
+            for c in ("K% raw","K% adj","Contact%","Whiff%"):
+                show[c]=pd.to_numeric(show[c],errors="coerce").round(1)
+            st.dataframe(show,hide_index=True,use_container_width=True)
+            high=[r["Hitter"] for r in lineup if safe_num(r.get("K% adj")) is not None and r["K% adj"]>=27]
+            low=[r["Hitter"] for r in lineup if safe_num(r.get("K% adj")) is not None and r["K% adj"]<=17]
+            protected=[f"{r['Hitter']} ({int(safe_num(r.get('PA')) or 0)} PA)"
+                       for r in lineup if str(r.get("Sample")) in ("VERY SMALL","SMALL")]
+            st.write("**High-K hitters (adjusted):** "+(", ".join(high) if high else "None flagged"))
+            st.write("**Low-K hitters (adjusted):** "+(", ".join(low) if low else "None flagged"))
+            if protected:
+                st.info("**Sample-Size Protection:** "+", ".join(protected)+
+                        ". Sus K% raw no entran directamente al motor; se ajustan hacia el K% del equipo vs la mano del pitcher.")
+            st.caption("K% raw = dato observado. K% adj = dato que usa el motor. Prior = K% del rival vs la mano del pitcher; fuerza de prior = 60 PA.")
         else:
             st.warning(f"NO cerrar análisis definitivo: {lineup_guard_status}")
         lineup_notes=st.text_area("Ausencias / sustituciones / diferencias vs lineup habitual",key="lineup_notes")
@@ -2805,6 +2856,7 @@ with tab_sources:
     src=pd.DataFrame([
         {"Fuente":"MLB Stats API","Uso":"Schedule, probables, season-to-date, logs, lineup, weather, umpire","Estado":"OK" if mlb else "Partial"},
         {"Fuente":"MLB Lineup Team Guard","Uso":"M8: Team ID + exactly 9 hitters + official opponent roster verification","Estado":lineup_guard_status},
+        {"Fuente":"M8 Sample-Size Protection","Uso":"Shrink individual K% vs hand toward team K% when PA sample is small","Estado":"ACTIVE · 60 PA prior"},
         {"Fuente":"Baseball Savant / Statcast","Uso":"Pitcher discipline, arsenal, movement, spin","Estado":"OK" if not sc_pitcher.empty else "ERROR"},
         {"Fuente":"Savant Team Page","Uso":"Opponent Contact, Chase, Zone, Whiff","Estado":opp_disc_source},
         {"Fuente":"Savant Pitch Arsenal","Uso":"Opponent vs pitch type","Estado":opp_pitch_source},
@@ -2822,4 +2874,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.2 LIVE VALIDATION · Lineup Team Guard · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.3 LIVE VALIDATION · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
