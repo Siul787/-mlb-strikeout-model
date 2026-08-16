@@ -29,7 +29,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.2.6 LIVE BOARD VALIDATION
+# V3.2.7 LIVE BOARD VALIDATION
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -2208,7 +2208,7 @@ def save_projection_snapshot(pitcher,proj,state=None,selected_date=None):
             "projected_bf":safe_num(proj.get("bf")),
             "projected_k_pct":safe_num(proj.get("k_pct")),
             "snapshot_timing":timing,
-            "model_version":"V3.2.6",
+            "model_version":"V3.2.7",
             "game_date":str(selected_date) if selected_date is not None else None,
             "captured_at_utc":datetime.now(timezone.utc).isoformat(),
         }
@@ -2295,7 +2295,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.6 LIVE VALIDATION · In-Card Live Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.7 LIVE VALIDATION · In-Card Live Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2387,13 +2387,20 @@ if st.session_state["view_mode"]=="slate":
             actual=live_state.get("pitcher_ks",{}).get(int(opt.get("pitcher_id"))) if live_state else None
 
             pieces=[]
-            if proj_k is not None:
-                pieces.append(f'<span class="proj">PROJ {proj_k:.2f} K</span>')
 
+            # Keep the game result/live count first, then show the frozen model
+            # projection directly underneath. Pregame only shows MODEL after the
+            # pitcher has been analyzed and a snapshot exists.
             if actual is not None and live_state.get("is_live"):
                 pieces.append(f'<span class="actual">LIVE {int(actual)} K</span>')
+                if proj_k is not None:
+                    pieces.append(f'<span class="proj">MODEL {proj_k:.2f} K</span>')
             elif actual is not None and live_state.get("is_final"):
                 pieces.append(f'<span class="finalk">FINAL {int(actual)} K</span>')
+                if proj_k is not None:
+                    pieces.append(f'<span class="proj">MODEL {proj_k:.2f} K</span>')
+            elif proj_k is not None:
+                pieces.append(f'<span class="proj">MODEL {proj_k:.2f} K</span>')
 
             if not pieces:
                 return '<span style="opacity:.32">—</span>'
@@ -2421,7 +2428,7 @@ if st.session_state["view_mode"]=="slate":
 
     board_html='<div class="board-grid">'+''.join(cards)+'</div>'
     st.markdown(board_html,unsafe_allow_html=True)
-    st.markdown('<div class="board-legend">Cada tarjeta muestra el score LIVE/FINAL. En pitchers analizados, PROJ conserva la primera proyección capturada; LIVE/FINAL K viene automáticamente de MLB.</div>',unsafe_allow_html=True)
+    st.markdown('<div class="board-legend">Cada tarjeta muestra el score LIVE/FINAL. En pitchers analizados, FINAL/LIVE K aparece primero y MODEL K debajo conserva la primera proyección capturada; los K reales vienen automáticamente de MLB.</div>',unsafe_allow_html=True)
 
     if any(live_game_state(g[0].get("game_pk")).get("is_live") for g in games if g):
         st.markdown('<meta http-equiv="refresh" content="30">',unsafe_allow_html=True)
@@ -2600,7 +2607,7 @@ with tab_summary:
     c.metric("Strikeouts proyectados",fmt(proj["central"],2))
     d.metric("Rango probable",f"{proj['low']:.1f}–{proj['high']:.1f}")
     if projection_snapshot_saved:
-        st.caption(f"Validation snapshot: {projection_snapshot_saved.get('projected_k',0):.2f} K · {projection_snapshot_saved.get('snapshot_timing','PREGAME')} · {projection_snapshot_saved.get('model_version','V3.2.6')}")
+        st.caption(f"Validation snapshot: {projection_snapshot_saved.get('projected_k',0):.2f} K · {projection_snapshot_saved.get('snapshot_timing','PREGAME')} · {projection_snapshot_saved.get('model_version','V3.2.7')}")
 
     st.subheader("Probabilidad por umbral")
     dist=[]
@@ -3079,4 +3086,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.6 LIVE VALIDATION · In-Card Live Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.7 LIVE VALIDATION · In-Card Live Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
