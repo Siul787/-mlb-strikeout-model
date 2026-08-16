@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone, timedelta
 from io import StringIO
+from pathlib import Path
+import json
 import math
 import unicodedata
 
@@ -27,7 +29,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.2.4 LIVE VALIDATION
+# V3.2.5 LIVE VALIDATION
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -159,6 +161,10 @@ st.markdown(
     }
     .board-link:hover{background:rgba(79,140,255,.22)}
     .board-legend{font-size:.70rem;opacity:.55;margin-top:-8px;margin-bottom:12px}
+    .board-live{margin:-1px -1px 7px;padding:5px 7px;border-radius:8px;font-size:.62rem;font-weight:900;text-align:center;letter-spacing:.02em;color:#bff8df;background:rgba(56,217,150,.12);border:1px solid rgba(56,217,150,.22)}
+    .board-final{color:#dfe6f5;background:rgba(150,160,185,.10);border-color:rgba(150,160,185,.18)}
+    .board-track{font-size:.58rem;line-height:1.35;margin-top:4px;color:#9fc0ff;font-weight:750;white-space:normal}
+    .board-track-final{color:#bff8df}
     @media (max-width:1100px){.board-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
     @media (max-width:760px){
       .board-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
@@ -2154,6 +2160,109 @@ def technical_analysis(mlb,pdisc,split_l,split_r,opp_disc,team_general,team_spli
 
 
 
+VALIDATION_SNAPSHOT_FILE = Path("/tmp/mlb_k_validation_snapshots.json")
+
+
+def _load_validation_snapshots():
+    try:
+        if VALIDATION_SNAPSHOT_FILE.exists():
+            data=json.loads(VALIDATION_SNAPSHOT_FILE.read_text())
+            return data if isinstance(data,dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+@st.cache_resource
+def validation_snapshots():
+    return _load_validation_snapshots()
+
+
+def _persist_validation_snapshots():
+    try:
+        VALIDATION_SNAPSHOT_FILE.write_text(
+            json.dumps(validation_snapshots(),ensure_ascii=False,indent=2,default=str)
+        )
+    except Exception:
+        pass
+
+
+def save_projection_snapshot(pitcher,proj,state=None,selected_date=None):
+    """Freeze the FIRST model projection seen for this pitcher/game."""
+    store=validation_snapshots()
+    key=f"{pitcher.get('game_pk')}:{pitcher.get('pitcher_id')}"
+    if key not in store:
+        state=state or {}
+        timing=("FINAL" if state.get("is_final") else ("LIVE" if state.get("is_live") else "PREGAME"))
+        store[key]={
+            "game_pk":pitcher.get("game_pk"),
+            "pitcher_id":pitcher.get("pitcher_id"),
+            "pitcher_name":pitcher.get("pitcher_name"),
+            "team":pitcher.get("team"),
+            "team_id":pitcher.get("team_id"),
+            "opponent":pitcher.get("opponent"),
+            "projected_k":safe_num(proj.get("central")),
+            "projected_bf":safe_num(proj.get("bf")),
+            "projected_k_pct":safe_num(proj.get("k_pct")),
+            "snapshot_timing":timing,
+            "model_version":"V3.2.5",
+            "game_date":str(selected_date) if selected_date is not None else None,
+            "captured_at_utc":datetime.now(timezone.utc).isoformat(),
+        }
+        _persist_validation_snapshots()
+    return store[key]
+
+
+def projection_snapshot(game_pk,pitcher_id):
+    return validation_snapshots().get(f"{game_pk}:{pitcher_id}")
+
+
+@st.cache_data(ttl=15,show_spinner=False)
+def live_game_state(game_pk:int):
+    try:
+        feed=get_json(f"{MLB_GAME_FEED_URL}/{game_pk}/feed/live")
+    except Exception:
+        return {}
+    gd=feed.get("gameData",{})
+    ld=feed.get("liveData",{})
+    status=gd.get("status",{})
+    linescore=ld.get("linescore",{})
+    box=ld.get("boxscore",{}).get("teams",{})
+    teams=gd.get("teams",{})
+
+    def runs(side):
+        v=linescore.get("teams",{}).get(side,{}).get("runs")
+        if v is None:
+            v=box.get(side,{}).get("teamStats",{}).get("batting",{}).get("runs")
+        try:return int(v or 0)
+        except Exception:return 0
+
+    pitcher_ks={}
+    for side in ("away","home"):
+        for pdata in box.get(side,{}).get("players",{}).values():
+            pid=pdata.get("person",{}).get("id")
+            pst=pdata.get("stats",{}).get("pitching",{})
+            if pid and pst:
+                try:pitcher_ks[int(pid)]=int(pst.get("strikeOuts",0) or 0)
+                except Exception:pitcher_ks[int(pid)]=0
+
+    abstract=status.get("abstractGameState") or "Preview"
+    coded=status.get("codedGameState")
+    is_final=abstract=="Final" or coded in {"F","O"}
+    is_live=abstract=="Live" and not is_final
+    inning=linescore.get("currentInning")
+    inning_state=linescore.get("inningState") or ""
+    inning_text=f"{inning_state} {inning}".strip() if inning else ""
+    return {
+        "is_live":is_live,"is_final":is_final,
+        "detailed":status.get("detailedState") or abstract,
+        "away_name":teams.get("away",{}).get("name","Away"),
+        "home_name":teams.get("home",{}).get("name","Home"),
+        "away_runs":runs("away"),"home_runs":runs("home"),
+        "inning_text":inning_text,"pitcher_ks":pitcher_ks,
+    }
+
+
 def slate_games(options):
     grouped={}
     for opt in options:
@@ -2183,7 +2292,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.4 LIVE VALIDATION · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.5 LIVE VALIDATION · Live Score · Validation Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2234,6 +2343,7 @@ if st.session_state["view_mode"]=="slate":
     cards=[]
     for game_opts in games:
         first=game_opts[0]
+        live_state=live_game_state(first.get("game_pk"))
         by_side={x.get("team_side"):x for x in game_opts}
         away=by_side.get("away",game_opts[0] if game_opts else None)
         home=by_side.get("home",game_opts[1] if len(game_opts)>1 else None)
@@ -2253,17 +2363,45 @@ if st.session_state["view_mode"]=="slate":
             parts=opt["pitcher_name"].split()
             return (parts[0][0]+". "+parts[-1]) if len(parts)>1 else opt["pitcher_name"]
 
+        score_html=""
+        if live_state.get("is_final"):
+            score_html=(f'<div class="board-live board-final">FINAL · {abbr(away["team"])} {live_state.get("away_runs",0)} - '
+                        f'{abbr(home["team"])} {live_state.get("home_runs",0)}</div>')
+        elif live_state.get("is_live"):
+            inning=live_state.get("inning_text") or live_state.get("detailed","LIVE")
+            score_html=(f'<div class="board-live">LIVE · {abbr(away["team"])} {live_state.get("away_runs",0)} - '
+                        f'{abbr(home["team"])} {live_state.get("home_runs",0)} · {inning}</div>')
+
+        def tracker_html(opt):
+            snap=projection_snapshot(opt.get("game_pk"),opt.get("pitcher_id"))
+            if not snap:
+                return ""
+            proj_k=safe_num(snap.get("projected_k"))
+            if proj_k is None:
+                return ""
+            txt=f"Modelo {proj_k:.2f} K"
+            actual=live_state.get("pitcher_ks",{}).get(int(opt.get("pitcher_id"))) if live_state else None
+            if actual is not None and (live_state.get("is_live") or live_state.get("is_final")):
+                txt+=f" · Actual {actual} K"
+                if live_state.get("is_final"):
+                    txt+=f" · Error {actual-proj_k:+.2f}"
+            if snap.get("snapshot_timing")!="PREGAME":
+                txt+=f" · Snapshot {snap.get('snapshot_timing')}"
+            cls="board-track board-track-final" if live_state.get("is_final") else "board-track"
+            return f'<div class="{cls}">{txt}</div>'
+
         cards.append(
             f'<div class="board-game">'
+            f'{score_html}'
             f'<div class="board-time">{first.get("game_time","TBD")} · {first.get("venue","")}</div>'
             f'<div class="board-team">'
             f'<img class="board-logo" src="{away_logo}">'
-            f'<div><div class="board-abbr">{abbr(away["team"])}</div><div class="board-pitcher">{pshort(away)} ({away["throwing_hand"][:1]})</div></div>'
+            f'<div><div class="board-abbr">{abbr(away["team"])}</div><div class="board-pitcher">{pshort(away)} ({away["throwing_hand"][:1]})</div>{tracker_html(away)}</div>'
             f'<div class="board-k">{fmt(away_snap.get("K%"),1,"%")}</div>'
             f'</div>'
             f'<div class="board-team">'
             f'<img class="board-logo" src="{home_logo}">'
-            f'<div><div class="board-abbr">{abbr(home["team"])}</div><div class="board-pitcher">{pshort(home)} ({home["throwing_hand"][:1]})</div></div>'
+            f'<div><div class="board-abbr">{abbr(home["team"])}</div><div class="board-pitcher">{pshort(home)} ({home["throwing_hand"][:1]})</div>{tracker_html(home)}</div>'
             f'<div class="board-k">{fmt(home_snap.get("K%"),1,"%")}</div>'
             f'</div>'
             f'<div class="board-actions">'
@@ -2274,7 +2412,34 @@ if st.session_state["view_mode"]=="slate":
 
     board_html='<div class="board-grid">'+''.join(cards)+'</div>'
     st.markdown(board_html,unsafe_allow_html=True)
-    st.markdown('<div class="board-legend">K% rápido = perfil base pregame. El board NO emite apuestas; abre un pitcher para M1–M9.</div>',unsafe_allow_html=True)
+    st.markdown('<div class="board-legend">K% rápido = perfil base pregame. LIVE/FINAL y K reales vienen de MLB. “Modelo” aparece solo en pitchers que ya fueron analizados y conserva la primera proyección capturada.</div>',unsafe_allow_html=True)
+
+    day_game_pks={str(g[0].get("game_pk")) for g in games if g}
+    tracked=[]
+    for snap in validation_snapshots().values():
+        if str(snap.get("game_pk")) not in day_game_pks:
+            continue
+        state=live_game_state(snap.get("game_pk"))
+        actual=state.get("pitcher_ks",{}).get(int(snap.get("pitcher_id"))) if state else None
+        status="FINAL" if state.get("is_final") else ("LIVE" if state.get("is_live") else "PREGAME")
+        proj_k=safe_num(snap.get("projected_k"))
+        tracked.append({
+            "Pitcher":snap.get("pitcher_name"),
+            "Model K":round(proj_k,2) if proj_k is not None else None,
+            "Actual K":actual if (state.get("is_live") or state.get("is_final")) else None,
+            "Error K":round(actual-proj_k,2) if (state.get("is_final") and actual is not None and proj_k is not None) else None,
+            "Status":status,
+            "Snapshot":snap.get("snapshot_timing"),
+            "Version":snap.get("model_version"),
+        })
+    if tracked:
+        with st.expander(f"VALIDATION TRACKER · {len(tracked)} PITCHERS ANALIZADOS",expanded=False):
+            st.dataframe(pd.DataFrame(tracked),hide_index=True,use_container_width=True)
+            st.caption("Model K queda congelado en la primera visita al análisis. Actual K y Error K se actualizan desde MLB durante/final del juego.")
+
+    if any(live_game_state(g[0].get("game_pk")).get("is_live") for g in games if g):
+        st.markdown('<meta http-equiv="refresh" content="30">',unsafe_allow_html=True)
+        st.caption("Live board: actualización automática cada 30 segundos mientras haya juegos en vivo.")
     st.stop()
 
 selected_id=st.session_state["selected_pitcher_id"]
@@ -2427,6 +2592,10 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
 proj=build_projection(mlb,pdisc,team_general,team_split,lineup,recent,park_so)
 proj=apply_leash_adjustment(proj,recent,auto_leash)
 
+# Freeze the first projection generated for this pitcher/game for live validation.
+validation_state=live_game_state(p.get("game_pk"))
+projection_snapshot_saved=save_projection_snapshot(p,proj,validation_state,game_date.isoformat())
+
 # ============================================================
 # TABS
 # ============================================================
@@ -2444,6 +2613,8 @@ with tab_summary:
     b.metric("K% proyectado",fmt(proj["k_pct"],1,"%"))
     c.metric("Strikeouts proyectados",fmt(proj["central"],2))
     d.metric("Rango probable",f"{proj['low']:.1f}–{proj['high']:.1f}")
+    if projection_snapshot_saved:
+        st.caption(f"Validation snapshot: {projection_snapshot_saved.get('projected_k',0):.2f} K · {projection_snapshot_saved.get('snapshot_timing','PREGAME')} · {projection_snapshot_saved.get('model_version','V3.2.5')}")
 
     st.subheader("Probabilidad por umbral")
     dist=[]
@@ -2922,4 +3093,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.4 LIVE VALIDATION · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.5 LIVE VALIDATION · Live Score · Validation Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
