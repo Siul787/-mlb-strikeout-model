@@ -29,7 +29,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.2.5 LIVE VALIDATION
+# V3.2.6 LIVE BOARD VALIDATION
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -152,7 +152,10 @@ st.markdown(
     .board-logo{width:25px;height:25px;object-fit:contain}
     .board-abbr{font-size:.78rem;font-weight:850}
     .board-pitcher{font-size:.62rem;opacity:.62;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .board-k{font-size:.67rem;font-weight:750}
+    .board-k{font-size:.62rem;font-weight:850;text-align:right;line-height:1.25;white-space:nowrap}
+    .board-k .proj{color:#9fc1ff}
+    .board-k .actual{color:#bff8df}
+    .board-k .finalk{color:#f7e29a}
     .board-actions{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:7px}
     .board-link{
       text-decoration:none!important;text-align:center;padding:5px 4px;border-radius:8px;
@@ -173,7 +176,7 @@ st.markdown(
       .board-team{grid-template-columns:22px 1fr auto;gap:4px}
       .board-abbr{font-size:.69rem}
       .board-pitcher,.board-time,.board-link{font-size:.54rem}
-      .board-k{font-size:.58rem}
+      .board-k{font-size:.52rem}
     }
 
     </style>
@@ -2205,7 +2208,7 @@ def save_projection_snapshot(pitcher,proj,state=None,selected_date=None):
             "projected_bf":safe_num(proj.get("bf")),
             "projected_k_pct":safe_num(proj.get("k_pct")),
             "snapshot_timing":timing,
-            "model_version":"V3.2.5",
+            "model_version":"V3.2.6",
             "game_date":str(selected_date) if selected_date is not None else None,
             "captured_at_utc":datetime.now(timezone.utc).isoformat(),
         }
@@ -2292,7 +2295,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.5 LIVE VALIDATION · Live Score · Validation Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.6 LIVE VALIDATION · In-Card Live Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2372,23 +2375,29 @@ if st.session_state["view_mode"]=="slate":
             score_html=(f'<div class="board-live">LIVE · {abbr(away["team"])} {live_state.get("away_runs",0)} - '
                         f'{abbr(home["team"])} {live_state.get("home_runs",0)} · {inning}</div>')
 
-        def tracker_html(opt):
+        def pitcher_k_html(opt):
+            """Compact per-pitcher status for the daily card.
+
+            Pregame: show frozen model projection only after that pitcher has been analyzed.
+            Live: show frozen projection (if available) + live strikeouts from MLB.
+            Final: show frozen projection (if available) + final strikeouts from MLB.
+            """
             snap=projection_snapshot(opt.get("game_pk"),opt.get("pitcher_id"))
-            if not snap:
-                return ""
-            proj_k=safe_num(snap.get("projected_k"))
-            if proj_k is None:
-                return ""
-            txt=f"Modelo {proj_k:.2f} K"
+            proj_k=safe_num(snap.get("projected_k")) if snap else None
             actual=live_state.get("pitcher_ks",{}).get(int(opt.get("pitcher_id"))) if live_state else None
-            if actual is not None and (live_state.get("is_live") or live_state.get("is_final")):
-                txt+=f" · Actual {actual} K"
-                if live_state.get("is_final"):
-                    txt+=f" · Error {actual-proj_k:+.2f}"
-            if snap.get("snapshot_timing")!="PREGAME":
-                txt+=f" · Snapshot {snap.get('snapshot_timing')}"
-            cls="board-track board-track-final" if live_state.get("is_final") else "board-track"
-            return f'<div class="{cls}">{txt}</div>'
+
+            pieces=[]
+            if proj_k is not None:
+                pieces.append(f'<span class="proj">PROJ {proj_k:.2f} K</span>')
+
+            if actual is not None and live_state.get("is_live"):
+                pieces.append(f'<span class="actual">LIVE {int(actual)} K</span>')
+            elif actual is not None and live_state.get("is_final"):
+                pieces.append(f'<span class="finalk">FINAL {int(actual)} K</span>')
+
+            if not pieces:
+                return '<span style="opacity:.32">—</span>'
+            return '<br>'.join(pieces)
 
         cards.append(
             f'<div class="board-game">'
@@ -2396,13 +2405,13 @@ if st.session_state["view_mode"]=="slate":
             f'<div class="board-time">{first.get("game_time","TBD")} · {first.get("venue","")}</div>'
             f'<div class="board-team">'
             f'<img class="board-logo" src="{away_logo}">'
-            f'<div><div class="board-abbr">{abbr(away["team"])}</div><div class="board-pitcher">{pshort(away)} ({away["throwing_hand"][:1]})</div>{tracker_html(away)}</div>'
-            f'<div class="board-k">{fmt(away_snap.get("K%"),1,"%")}</div>'
+            f'<div><div class="board-abbr">{abbr(away["team"])}</div><div class="board-pitcher">{pshort(away)} ({away["throwing_hand"][:1]})</div></div>'
+            f'<div class="board-k">{pitcher_k_html(away)}</div>'
             f'</div>'
             f'<div class="board-team">'
             f'<img class="board-logo" src="{home_logo}">'
-            f'<div><div class="board-abbr">{abbr(home["team"])}</div><div class="board-pitcher">{pshort(home)} ({home["throwing_hand"][:1]})</div>{tracker_html(home)}</div>'
-            f'<div class="board-k">{fmt(home_snap.get("K%"),1,"%")}</div>'
+            f'<div><div class="board-abbr">{abbr(home["team"])}</div><div class="board-pitcher">{pshort(home)} ({home["throwing_hand"][:1]})</div></div>'
+            f'<div class="board-k">{pitcher_k_html(home)}</div>'
             f'</div>'
             f'<div class="board-actions">'
             f'<a class="board-link" href="?pitcher={away["selection_id"]}">ANALIZAR {abbr(away["team"])}</a>'
@@ -2412,30 +2421,7 @@ if st.session_state["view_mode"]=="slate":
 
     board_html='<div class="board-grid">'+''.join(cards)+'</div>'
     st.markdown(board_html,unsafe_allow_html=True)
-    st.markdown('<div class="board-legend">K% rápido = perfil base pregame. LIVE/FINAL y K reales vienen de MLB. “Modelo” aparece solo en pitchers que ya fueron analizados y conserva la primera proyección capturada.</div>',unsafe_allow_html=True)
-
-    day_game_pks={str(g[0].get("game_pk")) for g in games if g}
-    tracked=[]
-    for snap in validation_snapshots().values():
-        if str(snap.get("game_pk")) not in day_game_pks:
-            continue
-        state=live_game_state(snap.get("game_pk"))
-        actual=state.get("pitcher_ks",{}).get(int(snap.get("pitcher_id"))) if state else None
-        status="FINAL" if state.get("is_final") else ("LIVE" if state.get("is_live") else "PREGAME")
-        proj_k=safe_num(snap.get("projected_k"))
-        tracked.append({
-            "Pitcher":snap.get("pitcher_name"),
-            "Model K":round(proj_k,2) if proj_k is not None else None,
-            "Actual K":actual if (state.get("is_live") or state.get("is_final")) else None,
-            "Error K":round(actual-proj_k,2) if (state.get("is_final") and actual is not None and proj_k is not None) else None,
-            "Status":status,
-            "Snapshot":snap.get("snapshot_timing"),
-            "Version":snap.get("model_version"),
-        })
-    if tracked:
-        with st.expander(f"VALIDATION TRACKER · {len(tracked)} PITCHERS ANALIZADOS",expanded=False):
-            st.dataframe(pd.DataFrame(tracked),hide_index=True,use_container_width=True)
-            st.caption("Model K queda congelado en la primera visita al análisis. Actual K y Error K se actualizan desde MLB durante/final del juego.")
+    st.markdown('<div class="board-legend">Cada tarjeta muestra el score LIVE/FINAL. En pitchers analizados, PROJ conserva la primera proyección capturada; LIVE/FINAL K viene automáticamente de MLB.</div>',unsafe_allow_html=True)
 
     if any(live_game_state(g[0].get("game_pk")).get("is_live") for g in games if g):
         st.markdown('<meta http-equiv="refresh" content="30">',unsafe_allow_html=True)
@@ -2614,7 +2600,7 @@ with tab_summary:
     c.metric("Strikeouts proyectados",fmt(proj["central"],2))
     d.metric("Rango probable",f"{proj['low']:.1f}–{proj['high']:.1f}")
     if projection_snapshot_saved:
-        st.caption(f"Validation snapshot: {projection_snapshot_saved.get('projected_k',0):.2f} K · {projection_snapshot_saved.get('snapshot_timing','PREGAME')} · {projection_snapshot_saved.get('model_version','V3.2.5')}")
+        st.caption(f"Validation snapshot: {projection_snapshot_saved.get('projected_k',0):.2f} K · {projection_snapshot_saved.get('snapshot_timing','PREGAME')} · {projection_snapshot_saved.get('model_version','V3.2.6')}")
 
     st.subheader("Probabilidad por umbral")
     dist=[]
@@ -3093,4 +3079,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.5 LIVE VALIDATION · Live Score · Validation Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.6 LIVE VALIDATION · In-Card Live Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
