@@ -142,13 +142,13 @@ st.markdown(
     .board-game{
       background:linear-gradient(150deg,rgba(23,27,37,.98),rgba(13,15,21,.99));
       border:1px solid rgba(130,145,180,.18);border-radius:14px;padding:10px;
-      height:196px;box-sizing:border-box;box-shadow:0 5px 16px rgba(0,0,0,.14);
-      display:flex;flex-direction:column;overflow:hidden
+      height:168px;box-sizing:border-box;box-shadow:0 5px 16px rgba(0,0,0,.14);
+      display:grid;grid-template-rows:30px 43px 43px 36px;overflow:hidden
     }
-    .board-time{font-size:.62rem;opacity:.56;text-align:center;margin-bottom:7px;min-height:28px;max-height:28px;line-height:1.25;display:flex;align-items:center;justify-content:center;overflow:hidden}
+    .board-time{font-size:.62rem;opacity:.62;text-align:center;margin:0;line-height:1.2;display:flex;align-items:center;justify-content:center;overflow:hidden;white-space:normal}
     .board-team{
-      display:grid;grid-template-columns:26px 1fr auto;align-items:center;gap:6px;
-      padding:5px 0;border-bottom:1px solid rgba(140,150,175,.08)
+      display:grid;grid-template-columns:26px 1fr 24px;align-items:center;gap:6px;
+      padding:4px 0;border-bottom:1px solid rgba(140,150,175,.08);min-height:0
     }
     .board-team:last-of-type{border-bottom:0}
     .board-logo{width:25px;height:25px;object-fit:contain}
@@ -157,14 +157,12 @@ st.markdown(
     .board-pitcher-link{color:inherit!important;text-decoration:none!important;border-bottom:1px dotted rgba(190,205,235,.35)}
     .board-pitcher-link:hover{color:#dce7ff!important;border-bottom-color:#9fc1ff}
     .board-score{font-size:.95rem;font-weight:950;text-align:right;line-height:1;min-width:18px;color:#f2f5fb}
-    .board-actions{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:auto;padding-top:7px}
+    .board-actions{display:grid;grid-template-columns:1fr 1fr;gap:5px;padding-top:4px;min-height:0}
     .board-metric{padding:5px 4px;border-radius:8px;font-size:.56rem;font-weight:850;text-align:center;line-height:1.35;background:rgba(63,116,220,.10);border:1px solid rgba(79,140,255,.18);min-height:34px;display:flex;flex-direction:column;align-items:center;justify-content:center;box-sizing:border-box}
     .board-metric .proj{color:#9fc1ff}
     .board-metric .actual{color:#bff8df}
     .board-metric .finalk{color:#f7e29a}
     .board-metric .muted{opacity:.38}
-    .board-status{margin:-1px -1px 7px;padding:5px 7px;border-radius:8px;font-size:.62rem;font-weight:900;text-align:center;letter-spacing:.02em;color:#bff8df;background:rgba(56,217,150,.12);border:1px solid rgba(56,217,150,.22);height:25px;box-sizing:border-box;display:flex;align-items:center;justify-content:center}
-    .board-pregame{color:#aeb8cb;background:rgba(100,115,145,.08);border-color:rgba(130,145,180,.14)}
     .board-legend{font-size:.70rem;opacity:.55;margin-top:-8px;margin-bottom:12px}
     .board-live{margin:-1px -1px 7px;padding:5px 7px;border-radius:8px;font-size:.62rem;font-weight:900;text-align:center;letter-spacing:.02em;color:#bff8df;background:rgba(56,217,150,.12);border:1px solid rgba(56,217,150,.22)}
     .board-final{color:#dfe6f5;background:rgba(150,160,185,.10);border-color:rgba(150,160,185,.18)}
@@ -173,7 +171,7 @@ st.markdown(
     @media (max-width:1100px){.board-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
     @media (max-width:760px){
       .board-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
-      .board-game{padding:7px;height:178px;border-radius:11px}
+      .board-game{padding:7px;height:160px;border-radius:11px;grid-template-rows:28px 40px 40px 34px}
       .board-logo{width:21px;height:21px}
       .board-team{grid-template-columns:22px 1fr auto;gap:4px}
       .board-abbr{font-size:.69rem}
@@ -483,6 +481,7 @@ def pitchers_for_date(selected_date: str):
                     "venue": venue.get("name","N/A"),
                     "status": game.get("status", {}).get("detailedState","N/A"),
                     "game_time": game_time_label(game.get("gameDate")),
+                    "game_date_raw": game.get("gameDate"),
                 })
     return options
 
@@ -2305,7 +2304,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.9 LIVE VALIDATION · ET Game Times · Uniform Cards · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.10 LIVE VALIDATION · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2376,14 +2375,25 @@ if st.session_state["view_mode"]=="slate":
             parts=opt["pitcher_name"].split()
             return (parts[0][0]+". "+parts[-1]) if len(parts)>1 else opt["pitcher_name"]
 
-        # Always reserve the same status row so every card has identical geometry.
-        if live_state.get("is_final"):
-            status_html='<div class="board-status board-final">FINAL</div>'
-        elif live_state.get("is_live"):
-            inning=live_state.get("inning_text") or live_state.get("detailed","LIVE")
-            status_html=f'<div class="board-status">LIVE · {inning}</div>'
-        else:
-            status_html='<div class="board-status board-pregame">PREGAME</div>'
+        # No separate LIVE/PREGAME header: the score itself communicates game state.
+        # Pregame = dash; once the game starts MLB supplies numeric runs (including 0-0).
+
+        def board_time_text(opt):
+            # Re-format directly from MLB gameDate at render time to avoid stale/UTC labels.
+            raw=opt.get("game_date_raw")
+            if raw:
+                try:
+                    dt=datetime.fromisoformat(str(raw).replace("Z","+00:00"))
+                    et=dt.astimezone(ZoneInfo("America/New_York"))
+                    return et.strftime("%-I:%M %p ET")
+                except Exception:
+                    try:
+                        return game_time_label(raw).replace("EDT","ET").replace("EST","ET")
+                    except Exception:
+                        pass
+            label=str(opt.get("game_time") or "TBD")
+            # Last-resort protection: never intentionally label a board time as UTC.
+            return label.replace(" UTC"," ET")
 
         def team_score(opt):
             if live_state.get("is_live") or live_state.get("is_final"):
@@ -2422,8 +2432,7 @@ if st.session_state["view_mode"]=="slate":
 
         cards.append(
             f'<div class="board-game">'
-            f'{status_html}'
-            f'<div class="board-time">{first.get("game_time","TBD")} · {first.get("venue","")}</div>'
+            f'<div class="board-time">{board_time_text(first)} · {first.get("venue","")}</div>'
             f'<div class="board-team">'
             f'<img class="board-logo" src="{away_logo}">'
             f'<div><div class="board-abbr">{abbr(away["team"])}</div><div class="board-pitcher">{pitcher_name_link(away)}</div></div>'
@@ -2442,7 +2451,7 @@ if st.session_state["view_mode"]=="slate":
 
     board_html='<div class="board-grid">'+''.join(cards)+'</div>'
     st.markdown(board_html,unsafe_allow_html=True)
-    st.markdown('<div class="board-legend">Horarios mostrados en ET (EDT/EST automático). El marcador está en la columna derecha de cada equipo. Abajo se muestran MODEL K y LIVE/FINAL K de cada pitcher. Para abrir el análisis, toca directamente el nombre del pitcher.</div>',unsafe_allow_html=True)
+    st.markdown('<div class="board-legend">Horario en ET. Antes del juego el score aparece como —; al comenzar cambia automáticamente a 0-0 o al marcador real. Abajo se muestran MODEL K y LIVE/FINAL K. Toca el nombre del pitcher para abrir el análisis.</div>',unsafe_allow_html=True)
 
     if any(live_game_state(g[0].get("game_pk")).get("is_live") for g in games if g):
         st.markdown('<meta http-equiv="refresh" content="30">',unsafe_allow_html=True)
@@ -3100,4 +3109,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.9 LIVE VALIDATION · ET Game Times · Uniform Cards · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.10 LIVE VALIDATION · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
