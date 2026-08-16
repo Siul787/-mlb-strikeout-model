@@ -29,7 +29,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.2.7 LIVE BOARD VALIDATION
+# V3.2.8 LIVE BOARD VALIDATION
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -152,17 +152,16 @@ st.markdown(
     .board-logo{width:25px;height:25px;object-fit:contain}
     .board-abbr{font-size:.78rem;font-weight:850}
     .board-pitcher{font-size:.62rem;opacity:.62;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .board-k{font-size:.62rem;font-weight:850;text-align:right;line-height:1.25;white-space:nowrap}
-    .board-k .proj{color:#9fc1ff}
-    .board-k .actual{color:#bff8df}
-    .board-k .finalk{color:#f7e29a}
+    .board-pitcher-link{color:inherit!important;text-decoration:none!important;border-bottom:1px dotted rgba(190,205,235,.35)}
+    .board-pitcher-link:hover{color:#dce7ff!important;border-bottom-color:#9fc1ff}
+    .board-score{font-size:.95rem;font-weight:950;text-align:right;line-height:1;min-width:18px;color:#f2f5fb}
     .board-actions{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:7px}
-    .board-link{
-      text-decoration:none!important;text-align:center;padding:5px 4px;border-radius:8px;
-      font-size:.61rem;font-weight:850;color:#dce7ff!important;
-      background:rgba(63,116,220,.13);border:1px solid rgba(79,140,255,.22)
-    }
-    .board-link:hover{background:rgba(79,140,255,.22)}
+    .board-metric{padding:5px 4px;border-radius:8px;font-size:.56rem;font-weight:850;text-align:center;line-height:1.35;background:rgba(63,116,220,.10);border:1px solid rgba(79,140,255,.18)}
+    .board-metric .proj{color:#9fc1ff}
+    .board-metric .actual{color:#bff8df}
+    .board-metric .finalk{color:#f7e29a}
+    .board-metric .muted{opacity:.38}
+    .board-status{margin:-1px -1px 7px;padding:5px 7px;border-radius:8px;font-size:.62rem;font-weight:900;text-align:center;letter-spacing:.02em;color:#bff8df;background:rgba(56,217,150,.12);border:1px solid rgba(56,217,150,.22)}
     .board-legend{font-size:.70rem;opacity:.55;margin-top:-8px;margin-bottom:12px}
     .board-live{margin:-1px -1px 7px;padding:5px 7px;border-radius:8px;font-size:.62rem;font-weight:900;text-align:center;letter-spacing:.02em;color:#bff8df;background:rgba(56,217,150,.12);border:1px solid rgba(56,217,150,.22)}
     .board-final{color:#dfe6f5;background:rgba(150,160,185,.10);border-color:rgba(150,160,185,.18)}
@@ -175,8 +174,9 @@ st.markdown(
       .board-logo{width:21px;height:21px}
       .board-team{grid-template-columns:22px 1fr auto;gap:4px}
       .board-abbr{font-size:.69rem}
-      .board-pitcher,.board-time,.board-link{font-size:.54rem}
-      .board-k{font-size:.52rem}
+      .board-pitcher,.board-time{font-size:.54rem}
+      .board-score{font-size:.82rem}
+      .board-metric{font-size:.50rem}
     }
 
     </style>
@@ -2295,7 +2295,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.7 LIVE VALIDATION · In-Card Live Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.8 LIVE VALIDATION · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2366,69 +2366,71 @@ if st.session_state["view_mode"]=="slate":
             parts=opt["pitcher_name"].split()
             return (parts[0][0]+". "+parts[-1]) if len(parts)>1 else opt["pitcher_name"]
 
-        score_html=""
+        status_html=""
         if live_state.get("is_final"):
-            score_html=(f'<div class="board-live board-final">FINAL · {abbr(away["team"])} {live_state.get("away_runs",0)} - '
-                        f'{abbr(home["team"])} {live_state.get("home_runs",0)}</div>')
+            status_html='<div class="board-status board-final">FINAL</div>'
         elif live_state.get("is_live"):
             inning=live_state.get("inning_text") or live_state.get("detailed","LIVE")
-            score_html=(f'<div class="board-live">LIVE · {abbr(away["team"])} {live_state.get("away_runs",0)} - '
-                        f'{abbr(home["team"])} {live_state.get("home_runs",0)} · {inning}</div>')
+            status_html=f'<div class="board-status">LIVE · {inning}</div>'
 
-        def pitcher_k_html(opt):
-            """Compact per-pitcher status for the daily card.
+        def team_score(opt):
+            if live_state.get("is_live") or live_state.get("is_final"):
+                side=opt.get("team_side")
+                runs=live_state.get("away_runs",0) if side=="away" else live_state.get("home_runs",0)
+                return str(int(runs or 0))
+            return "—"
 
-            Pregame: show frozen model projection only after that pitcher has been analyzed.
-            Live: show frozen projection (if available) + live strikeouts from MLB.
-            Final: show frozen projection (if available) + final strikeouts from MLB.
+        def pitcher_metric_html(opt):
+            """Bottom-of-card pitcher projection + live/final Ks.
+
+            The pitcher name itself is the analysis link. This strip is display-only.
             """
             snap=projection_snapshot(opt.get("game_pk"),opt.get("pitcher_id"))
             proj_k=safe_num(snap.get("projected_k")) if snap else None
             actual=live_state.get("pitcher_ks",{}).get(int(opt.get("pitcher_id"))) if live_state else None
 
             pieces=[]
+            if proj_k is not None:
+                pieces.append(f'<span class="proj">MODEL {proj_k:.2f} K</span>')
+            else:
+                pieces.append('<span class="muted">MODEL —</span>')
 
-            # Keep the game result/live count first, then show the frozen model
-            # projection directly underneath. Pregame only shows MODEL after the
-            # pitcher has been analyzed and a snapshot exists.
             if actual is not None and live_state.get("is_live"):
                 pieces.append(f'<span class="actual">LIVE {int(actual)} K</span>')
-                if proj_k is not None:
-                    pieces.append(f'<span class="proj">MODEL {proj_k:.2f} K</span>')
             elif actual is not None and live_state.get("is_final"):
                 pieces.append(f'<span class="finalk">FINAL {int(actual)} K</span>')
-                if proj_k is not None:
-                    pieces.append(f'<span class="proj">MODEL {proj_k:.2f} K</span>')
-            elif proj_k is not None:
-                pieces.append(f'<span class="proj">MODEL {proj_k:.2f} K</span>')
+            elif live_state.get("is_live") or live_state.get("is_final"):
+                pieces.append('<span class="muted">K —</span>')
 
-            if not pieces:
-                return '<span style="opacity:.32">—</span>'
             return '<br>'.join(pieces)
+
+        def pitcher_name_link(opt):
+            return (f'<a class="board-pitcher-link" href="?pitcher={opt["selection_id"]}">'
+                    f'{pshort(opt)} ({opt["throwing_hand"][:1]})</a>')
 
         cards.append(
             f'<div class="board-game">'
-            f'{score_html}'
+            f'{status_html}'
             f'<div class="board-time">{first.get("game_time","TBD")} · {first.get("venue","")}</div>'
             f'<div class="board-team">'
             f'<img class="board-logo" src="{away_logo}">'
-            f'<div><div class="board-abbr">{abbr(away["team"])}</div><div class="board-pitcher">{pshort(away)} ({away["throwing_hand"][:1]})</div></div>'
-            f'<div class="board-k">{pitcher_k_html(away)}</div>'
+            f'<div><div class="board-abbr">{abbr(away["team"])}</div><div class="board-pitcher">{pitcher_name_link(away)}</div></div>'
+            f'<div class="board-score">{team_score(away)}</div>'
             f'</div>'
             f'<div class="board-team">'
             f'<img class="board-logo" src="{home_logo}">'
-            f'<div><div class="board-abbr">{abbr(home["team"])}</div><div class="board-pitcher">{pshort(home)} ({home["throwing_hand"][:1]})</div></div>'
-            f'<div class="board-k">{pitcher_k_html(home)}</div>'
+            f'<div><div class="board-abbr">{abbr(home["team"])}</div><div class="board-pitcher">{pitcher_name_link(home)}</div></div>'
+            f'<div class="board-score">{team_score(home)}</div>'
             f'</div>'
             f'<div class="board-actions">'
-            f'<a class="board-link" href="?pitcher={away["selection_id"]}">ANALIZAR {abbr(away["team"])}</a>'
-            f'<a class="board-link" href="?pitcher={home["selection_id"]}">ANALIZAR {abbr(home["team"])}</a>'
+            f'<div class="board-metric">{pitcher_metric_html(away)}</div>'
+            f'<div class="board-metric">{pitcher_metric_html(home)}</div>'
             f'</div></div>'
         )
 
     board_html='<div class="board-grid">'+''.join(cards)+'</div>'
     st.markdown(board_html,unsafe_allow_html=True)
-    st.markdown('<div class="board-legend">Cada tarjeta muestra el score LIVE/FINAL. En pitchers analizados, FINAL/LIVE K aparece primero y MODEL K debajo conserva la primera proyección capturada; los K reales vienen automáticamente de MLB.</div>',unsafe_allow_html=True)
+    st.markdown('<div class="board-legend">El marcador está en la columna derecha de cada equipo. Abajo se muestran MODEL K y LIVE/FINAL K de cada pitcher. Para abrir el análisis, toca directamente el nombre del pitcher.</div>',unsafe_allow_html=True)
 
     if any(live_game_state(g[0].get("game_pk")).get("is_live") for g in games if g):
         st.markdown('<meta http-equiv="refresh" content="30">',unsafe_allow_html=True)
@@ -3086,4 +3088,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.7 LIVE VALIDATION · In-Card Live Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.8 LIVE VALIDATION · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
