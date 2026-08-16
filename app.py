@@ -7,6 +7,7 @@ from io import StringIO
 from pathlib import Path
 import json
 import math
+import re
 import unicodedata
 
 import pandas as pd
@@ -30,7 +31,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.2.9 LIVE BOARD VALIDATION
+# V3.2.11 LIVE BOARD VALIDATION
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -1945,6 +1946,170 @@ def action_public_status():
 
 
 
+
+
+SPORTSBOOK_ALIASES = {
+    "draftkings": "DraftKings", "dk": "DraftKings",
+    "fanduel": "FanDuel", "fd": "FanDuel",
+    "betmgm": "BetMGM", "mgm": "BetMGM",
+    "caesars": "Caesars", "fanatics": "Fanatics",
+    "bet365": "bet365", "betrivers": "BetRivers",
+}
+
+def _detect_book(text):
+    t=normalize_name(text)
+    for k,v in SPORTSBOOK_ALIASES.items():
+        if k in t:
+            return v
+    return None
+
+def _american_from_any(v):
+    if isinstance(v,(int,float)):
+        x=float(v)
+        if abs(x)>=100 and abs(x)<=5000:
+            return int(round(x))
+        return None
+    if isinstance(v,str):
+        m=re.search(r'(?<!\d)([+-]\d{2,4})(?!\d)',v.replace('−','-'))
+        if m:
+            try:return int(m.group(1))
+            except Exception:return None
+    return None
+
+def _line_from_any(v):
+    if isinstance(v,(int,float)):
+        x=float(v)
+        if 0.5 <= x <= 20:
+            return x
+        return None
+    if isinstance(v,str):
+        m=re.search(r'(?<!\d)(\d{1,2}(?:\.5)?)(?!\d)',v)
+        if m:
+            try:
+                x=float(m.group(1)); return x if .5<=x<=20 else None
+            except Exception:return None
+    return None
+
+def _market_from_text(text,line=None):
+    t=str(text or '').lower().replace('strikeouts',' ').replace('strikeout',' ')
+    if re.search(r'\bunder\b|\bu\s*\d',t): return 'Under'
+    if re.search(r'\bover\b|\bo\s*\d',t): return 'Over'
+    m=re.search(r'(?<!\d)(\d{1,2})\s*\+',t)
+    if m:return f'Alt {int(m.group(1))}+'
+    return None
+
+def _dedupe_market_rows(rows):
+    out=[];seen=set()
+    for r in rows:
+        book=str(r.get('Sportsbook') or 'Action Network')
+        market=str(r.get('Market') or '').strip()
+        line=safe_num(r.get('Line'));odds=safe_num(r.get('Odds'))
+        if not market or line is None or odds is None:continue
+        key=(book.lower(),market.lower(),round(line,2),int(odds))
+        if key in seen:continue
+        seen.add(key)
+        out.append({'Sportsbook':book,'Market':market,'Line':float(line),'Odds':int(odds),'Source':r.get('Source','Action Network')})
+    return out
+
+def _extract_action_from_text_block(text,book=None):
+    rows=[]
+    clean=' '.join(str(text or '').replace('−','-').split())
+    book=book or _detect_book(clean) or 'Action Network'
+    pats=[
+        (r'(?i)\bover\s*(\d{1,2}(?:\.5)?)\s*([+-]\d{2,4})','Over'),
+        (r'(?i)\bo\s*(\d{1,2}(?:\.5)?)\s*([+-]\d{2,4})','Over'),
+        (r'(?i)\bunder\s*(\d{1,2}(?:\.5)?)\s*([+-]\d{2,4})','Under'),
+        (r'(?i)\bu\s*(\d{1,2}(?:\.5)?)\s*([+-]\d{2,4})','Under'),
+    ]
+    for pat,market in pats:
+        for m in re.finditer(pat,clean):
+            rows.append({'Sportsbook':book,'Market':market,'Line':float(m.group(1)),'Odds':int(m.group(2)),'Source':'Action Network public props'})
+    for m in re.finditer(r'(?<!\d)(\d{1,2})\s*\+\s*([+-]\d{2,4})',clean):
+        rows.append({'Sportsbook':book,'Market':f'Alt {int(m.group(1))}+','Line':float(m.group(1)),'Odds':int(m.group(2)),'Source':'Action Network public props'})
+    return rows
+
+def _walk_action_json(obj,pitcher_norm,inherited=False,rows=None):
+    if rows is None:rows=[]
+    if isinstance(obj,dict):
+        scalar=' '.join(str(v) for v in obj.values() if isinstance(v,(str,int,float,bool)) and v is not None)
+        here=inherited or (pitcher_norm and pitcher_norm in normalize_name(scalar))
+        if here:
+            # First try textual patterns from the local object.
+            rows.extend(_extract_action_from_text_block(scalar,_detect_book(scalar)))
+            low={str(k).lower():v for k,v in obj.items()}
+            odds=None;line=None;market=None;book=None
+            for k,v in low.items():
+                if odds is None and ('odd' in k or 'price' in k):odds=_american_from_any(v)
+                if line is None and any(x in k for x in ('line','handicap','threshold','total')):line=_line_from_any(v)
+                if market is None and any(x in k for x in ('market','side','selection','label','name')):market=_market_from_text(v,line)
+                if book is None and any(x in k for x in ('book','sportsbook','operator')):book=_detect_book(v)
+            if odds is not None and line is not None and market:
+                rows.append({'Sportsbook':book or 'Action Network','Market':market,'Line':line,'Odds':odds,'Source':'Action Network embedded data'})
+        for v in obj.values():
+            if isinstance(v,(dict,list)):_walk_action_json(v,pitcher_norm,here,rows)
+    elif isinstance(obj,list):
+        for v in obj:_walk_action_json(v,pitcher_norm,inherited,rows)
+    return rows
+
+@st.cache_data(ttl=60,show_spinner=False)
+def action_auto_k_odds(pitcher_name):
+    """Best-effort automatic strikeout odds from Action Network's public pitching-props page.
+    Never fabricates prices: if a real American price cannot be parsed, returns an empty table.
+    """
+    cols=['Sportsbook','Market','Line','Odds','Source']
+    try:
+        r=requests.get(ACTION_PITCHING_PROPS_URL,headers={
+            'User-Agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1',
+            'Accept-Language':'en-US,en;q=0.9',
+        },timeout=TIMEOUT)
+        r.raise_for_status()
+        soup=BeautifulSoup(r.text,'html.parser')
+        pn=normalize_name(pitcher_name)
+        last=pn.split()[-1] if pn else ''
+        rows=[]
+
+        # 1) Server-rendered DOM: inspect local containers containing the pitcher.
+        for node in soup.find_all(string=True):
+            txt=' '.join(str(node).split())
+            nt=normalize_name(txt)
+            if not txt or not last or (pn not in nt and last not in nt):continue
+            cur=node.parent
+            for _ in range(5):
+                if cur is None:break
+                block=' '.join(cur.stripped_strings)
+                if len(block)<=2500:
+                    rows.extend(_extract_action_from_text_block(block,_detect_book(block)))
+                cur=cur.parent
+
+        # 2) Embedded JSON / Next.js payloads.
+        for sc in soup.find_all('script'):
+            raw=sc.string or sc.get_text() or ''
+            raw=raw.strip()
+            if not raw or (pn not in normalize_name(raw) and last not in normalize_name(raw)):
+                continue
+            if raw.startswith('{') or raw.startswith('['):
+                try:
+                    data=json.loads(raw)
+                    rows.extend(_walk_action_json(data,pn))
+                except Exception:
+                    pass
+            # Also inspect the script as text for compact odds strings.
+            idx=normalize_name(raw).find(last) if last else -1
+            if idx>=0:
+                # Raw and normalized offsets differ; use broad raw chunks instead.
+                rows.extend(_extract_action_from_text_block(raw[:120000],_detect_book(raw[:120000])))
+
+        rows=_dedupe_market_rows(rows)
+        # Prefer identifiable books, but keep Action best/consensus if that is all the public page exposes.
+        df=pd.DataFrame(rows,columns=cols)
+        if df.empty:return df
+        # Remove obviously malformed duplicate combinations and sort main O/U before alts.
+        df=df[(df['Odds'].abs()>=100)&(df['Odds'].abs()<=5000)&(df['Line']>=0.5)&(df['Line']<=20)].copy()
+        return df.drop_duplicates(subset=['Sportsbook','Market','Line','Odds']).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+
 def market_hit(k_value,market,line):
     k=safe_num(k_value);ln=safe_num(line)
     if k is None or ln is None:return None
@@ -2304,7 +2469,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.10 LIVE VALIDATION · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.12 LIVE VALIDATION · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2823,71 +2988,57 @@ with tab_modules:
 # MARKET / ALL LINES
 # ------------------------------------------------------------
 with tab_market:
-    st.subheader("M9 · TODAS las líneas disponibles")
-    st.caption("Añade solamente las líneas reales que tengas en DraftKings y FanDuel. El modelo evalúa cada precio y NO fuerza la línea principal.")
+    st.subheader("M9 · CUOTAS REALES AUTOMÁTICAS")
+    st.caption("El modelo intenta leer automáticamente las líneas reales de strikeouts publicadas por Action Network. Nunca inventa precios: si no puede verificar una cuota, M9 queda pendiente y el dictamen es NO BET.")
 
-    default_market=pd.DataFrame([
-        {"Sportsbook":"DraftKings","Market":"Over","Line":4.5,"Odds":-110},
-        {"Sportsbook":"DraftKings","Market":"Under","Line":4.5,"Odds":-110},
-        {"Sportsbook":"DraftKings","Market":"Over","Line":5.5,"Odds":-110},
-        {"Sportsbook":"DraftKings","Market":"Under","Line":5.5,"Odds":-110},
-        {"Sportsbook":"FanDuel","Market":"Over","Line":4.5,"Odds":-110},
-        {"Sportsbook":"FanDuel","Market":"Under","Line":4.5,"Odds":-110},
-        {"Sportsbook":"FanDuel","Market":"Over","Line":5.5,"Odds":-110},
-        {"Sportsbook":"FanDuel","Market":"Under","Line":5.5,"Odds":-110},
-        {"Sportsbook":"DraftKings","Market":"Alt 4+","Line":4.0,"Odds":100},
-        {"Sportsbook":"FanDuel","Market":"Alt 5+","Line":5.0,"Odds":100},
-    ])
+    auto_market=action_auto_k_odds(p["pitcher_name"])
+    if st.button("↻ Actualizar cuotas ahora",key="refresh_auto_odds"):
+        action_auto_k_odds.clear()
+        st.rerun()
 
-    market_input=st.data_editor(
-        default_market,num_rows="dynamic",hide_index=True,use_container_width=True,
-        column_config={
-            "Sportsbook":st.column_config.SelectboxColumn(options=["DraftKings","FanDuel"]),
-            "Market":st.column_config.TextColumn(help="Examples: Over, Under, Alt 4+, Alt 5+, Alt 6+"),
-            "Line":st.column_config.NumberColumn(step=.5),
-            "Odds":st.column_config.NumberColumn(step=5),
-        },
-        key="all_market_lines"
-    )
-
-    rows=[]
-    for _,r in market_input.iterrows():
-        book=str(r.get("Sportsbook",""))
-        market=str(r.get("Market","")).strip()
-        line=safe_num(r.get("Line")); odds=safe_num(r.get("Odds"))
-        if not book or not market or line is None or odds is None:
-            continue
-
-        low_market=market.lower()
-        if low_market.startswith("over"):
-            threshold=math.floor(line)+1
-            prob=poisson_ge(threshold,proj["central"])
-        elif low_market.startswith("under"):
-            maxk=math.floor(line)
-            prob=poisson_cdf(maxk,proj["central"])
-        elif "alt" in low_market or "+" in low_market:
-            # line itself is treated as the integer threshold for alt K+
-            threshold=int(round(line))
-            prob=poisson_ge(threshold,proj["central"])
+    if auto_market.empty:
+        st.warning("M9 DATA UNAVAILABLE · No pude verificar cuotas públicas de strikeouts para este pitcher ahora mismo. NO BET hasta que una fuente automática devuelva precios reales.")
+        market_df=pd.DataFrame()
+    else:
+        st.success(f"AUTO ODDS OK · {len(auto_market)} precios reales detectados para {p['pitcher_name']}.")
+        st.dataframe(auto_market,hide_index=True,use_container_width=True)
+        rows=[]
+        for _,r in auto_market.iterrows():
+            book=str(r.get("Sportsbook","")).strip() or "Action Network"
+            market=str(r.get("Market","")).strip()
+            line=safe_num(r.get("Line")); odds=safe_num(r.get("Odds"))
+            if not market or line is None or odds is None:continue
+            low_market=market.lower()
+            if low_market.startswith("over"):
+                threshold=math.floor(line)+1
+                prob=poisson_ge(threshold,proj["central"])
+            elif low_market.startswith("under"):
+                maxk=math.floor(line)
+                prob=poisson_cdf(maxk,proj["central"])
+            elif "alt" in low_market or "+" in low_market:
+                threshold=int(round(line))
+                prob=poisson_ge(threshold,proj["central"])
+            else:
+                continue
+            implied=american_implied(odds)
+            edge=prob*100-implied if implied is not None else None
+            ev=ev_per_dollar(prob,odds)
+            rows.append({
+                "Sportsbook":book,"Market":market,"Line":line,"Odds":int(odds),
+                "Model%":prob*100,"Implied%":implied,"Fair":fair_american(prob),
+                "Edge pp":edge,"EV%":ev*100 if ev is not None else None,
+                "Source":r.get("Source","Action Network public props")
+            })
+        market_df=pd.DataFrame(rows)
+        if not market_df.empty:
+            market_df=append_line_history(market_df,log)
+            for col in ("Model%","Implied%","Fair","Edge pp","EV%","Hit L5%","Hit L10%"):
+                market_df[col]=pd.to_numeric(market_df[col],errors="coerce").round(1)
+            st.markdown("**Evaluación automática de todas las cuotas verificadas**")
+            st.dataframe(market_df.sort_values("EV%",ascending=False),hide_index=True,use_container_width=True)
+            st.caption("Las cuotas se vuelven a consultar cada 60 s. Hit L5/L10 es descriptivo. Si Action cambia su página o bloquea el acceso, M9 se cierra en NO BET en vez de usar un precio ficticio.")
         else:
-            continue
-
-        implied=american_implied(odds)
-        edge=prob*100-implied if implied is not None else None
-        ev=ev_per_dollar(prob,odds)
-        rows.append({
-            "Sportsbook":book,"Market":market,"Line":line,"Odds":int(odds),
-            "Model%":prob*100,"Implied%":implied,"Fair":fair_american(prob),
-            "Edge pp":edge,"EV%":ev*100 if ev is not None else None
-        })
-
-    market_df=pd.DataFrame(rows)
-    if not market_df.empty:
-        market_df=append_line_history(market_df,log)
-        for col in ("Model%","Implied%","Fair","Edge pp","EV%","Hit L5%","Hit L10%"):
-            market_df[col]=pd.to_numeric(market_df[col],errors="coerce").round(1)
-        st.dataframe(market_df.sort_values("EV%",ascending=False),hide_index=True,use_container_width=True)
-        st.caption("Hit L5/L10 = historial descriptivo del pitcher contra esa línea; no sustituye la probabilidad del modelo.")
+            st.warning("Se detectó información de mercado, pero ninguna línea de K pudo verificarse con formato completo (mercado + línea + American odds). NO BET.")
 
     st.divider()
     st.subheader("Action Network PRO / B.A.R.T.O.L.O. validation")
@@ -3078,7 +3229,7 @@ with tab_analysis:
 
         st.caption("Una calificación A NO obliga a apostar. Sin edge/EV suficiente = NO BET.")
     else:
-        st.warning("No hay líneas válidas cargadas. Dictamen: PASS hasta introducir precios reales.")
+        st.warning("M9 PENDIENTE · No hay cuotas reales cargadas. Dictamen: NO BET hasta introducir el precio actual del sportsbook.")
 
     st.progress(modules/9)
     st.caption(" · ".join(f"{k} {'✅' if v else '⏳'}" for k,v in status.items()))
@@ -3098,8 +3249,8 @@ with tab_sources:
         {"Fuente":"Savant SO Park Factor","Uso":"M7","Estado":f"{fmt(park_so,0)} · {park_source}"},
         {"Fuente":"Baseball-Reference","Uso":"Cross-check + fallback cuando la métrica existe públicamente","Estado":"OK" if br else "No match"},
         {"Fuente":"FanGraphs","Uso":"Validation / xFIP / SIERA when reachable","Estado":fg_status},
-        {"Fuente":"Action Network PRO","Uso":"B.A.R.T.O.L.O., % Bets, % Money, sharp, movement","Estado":"Manual PRO validation"},
-        {"Fuente":"DraftKings / FanDuel","Uso":"Official model prices in current phase","Estado":"Manual line/odds entry"},
+        {"Fuente":"Action Network PRO","Uso":"Automatic public K odds + B.A.R.T.O.L.O., % Bets, % Money, sharp, movement","Estado":"AUTO ODDS + Manual PRO validation"},
+        {"Fuente":"Sportsbook K Odds","Uso":"Automatic real strikeout prices parsed from Action Network public props","Estado":"AUTO · fails closed to NO BET"},
         {"Fuente":"OpenAI Responses API","Uso":"Analista IA explicativo; no modifica la proyección cuantitativa","Estado":ai_status()},
     ])
     st.dataframe(src,hide_index=True,use_container_width=True)
@@ -3109,4 +3260,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.10 LIVE VALIDATION · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.12 LIVE VALIDATION · Automatic Real Odds · Action Network Public Props · No Fabricated Prices · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
