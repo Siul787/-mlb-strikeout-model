@@ -31,7 +31,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.2.14 LIVE BOARD VALIDATION
+# V3.2.15 LIVE BOARD VALIDATION
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -2403,7 +2403,7 @@ def save_projection_snapshot(pitcher,proj,state=None,selected_date=None):
             "lineup_confirmed":True if proj.get("lineup_confirmed") else False,
             "analysis_ready":True if proj.get("analysis_ready") else False,
             "module_status":proj.get("module_status",{}),
-            "model_version":"V3.2.14",
+            "model_version":"V3.2.15",
             "game_date":str(selected_date) if selected_date is not None else None,
             "captured_at_utc":datetime.now(timezone.utc).isoformat(),
         }
@@ -2413,6 +2413,22 @@ def save_projection_snapshot(pitcher,proj,state=None,selected_date=None):
 
 def projection_snapshot(game_pk,pitcher_id):
     return validation_snapshots().get(f"{game_pk}:{pitcher_id}")
+
+
+def official_projection_snapshot(game_pk,pitcher_id):
+    """Return only validation-eligible snapshots.
+
+    V3.2.13 could persist provisional AUTO projections before the official lineup.
+    Those rows must never appear as MODEL K or enter Records after the 100% gate.
+    """
+    snap=projection_snapshot(game_pk,pitcher_id)
+    if not snap:
+        return None
+    if not (snap.get("lineup_confirmed") and snap.get("analysis_ready")):
+        return None
+    if str(snap.get("snapshot_timing") or "").upper()!="PREGAME":
+        return None
+    return snap
 
 
 @st.cache_data(ttl=15,show_spinner=False)
@@ -2669,7 +2685,7 @@ def save_auto_projection_snapshot(pitcher,proj,state=None,selected_date=None):
         "analysis_ready":new_ready,
         "module_status":proj.get("module_status",{}),
         "lineup_guard_status":proj.get("lineup_guard_status"),
-        "model_version":"V3.2.14",
+        "model_version":"V3.2.15",
         "game_date":str(selected_date) if selected_date is not None else None,
         "captured_at_utc":datetime.now(timezone.utc).isoformat(),
     }
@@ -2706,6 +2722,18 @@ def ensure_automatic_slate_projections(options, selected_date):
         progress.progress(i/len(eligible),text=f"Generando proyecciones automáticas {i}/{len(eligible)}")
     progress.empty()
     return done,failed
+
+
+def purge_provisional_snapshots():
+    """Remove legacy provisional snapshots created before the official 100% gate."""
+    store=validation_snapshots()
+    bad=[k for k,v in list(store.items()) if not (v.get("lineup_confirmed") and v.get("analysis_ready"))]
+    if not bad:
+        return 0
+    for k in bad:
+        store.pop(k,None)
+    _persist_validation_snapshots()
+    return len(bad)
 
 
 def validation_record_rows():
@@ -2790,7 +2818,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.14 LIVE VALIDATION · Confirmed-Lineup 100% Gate · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.15 LIVE VALIDATION · Confirmed-Lineup 100% Gate · Official Snapshot Cleanup · Records Fix · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2799,6 +2827,9 @@ if "view_mode" not in st.session_state:
     st.session_state["view_mode"]="slate"
 if "selected_pitcher_id" not in st.session_state:
     st.session_state["selected_pitcher_id"]=None
+if not st.session_state.get("official_snapshot_cleanup_v3215"):
+    purge_provisional_snapshots()
+    st.session_state["official_snapshot_cleanup_v3215"]=True
 
 date_col,records_col,_=st.columns([1.15,.85,1.15])
 with date_col:
@@ -2822,7 +2853,10 @@ if not options:
 by_id={x["selection_id"]:x for x in options}
 if st.session_state.get("selected_pitcher_id") not in by_id:
     st.session_state["selected_pitcher_id"]=None
-    st.session_state["view_mode"]="slate"
+    # Do not kick the user out of Records just because a previously selected
+    # pitcher belongs to another date/slate. Only analysis requires a valid ID.
+    if st.session_state.get("view_mode")=="analysis":
+        st.session_state["view_mode"]="slate"
 
 # Query-param navigation allows the daily board to be pure compact HTML.
 qp_pitch = st.query_params.get("pitcher")
@@ -2911,7 +2945,7 @@ if st.session_state["view_mode"]=="slate":
 
             The pitcher name itself is the analysis link. This strip is display-only.
             """
-            snap=projection_snapshot(opt.get("game_pk"),opt.get("pitcher_id"))
+            snap=official_projection_snapshot(opt.get("game_pk"),opt.get("pitcher_id"))
             proj_k=safe_num(snap.get("projected_k")) if snap else None
             actual=live_state.get("pitcher_ks",{}).get(int(opt.get("pitcher_id"))) if live_state else None
 
@@ -3147,7 +3181,7 @@ with tab_summary:
     c.metric("Strikeouts proyectados",fmt(proj["central"],2))
     d.metric("Rango probable",f"{proj['low']:.1f}–{proj['high']:.1f}")
     if projection_snapshot_saved and projection_snapshot_saved.get("analysis_ready"):
-        st.caption(f"OFFICIAL MODEL K: {projection_snapshot_saved.get('projected_k',0):.2f} K · lineup confirmado · M1-M8 100% · {projection_snapshot_saved.get('model_version','V3.2.14')}")
+        st.caption(f"OFFICIAL MODEL K: {projection_snapshot_saved.get('projected_k',0):.2f} K · lineup confirmado · M1-M8 100% · {projection_snapshot_saved.get('model_version','V3.2.15')}")
     elif not proj.get("lineup_confirmed"):
         st.warning("PROYECCIÓN NO OFICIAL · Esperando lineup confirmado de MLB. No se guarda en RÉCORDS.")
     elif not proj.get("analysis_ready"):
@@ -3617,4 +3651,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.14 LIVE VALIDATION · Automatic Real Odds · Action Network Public Props · No Fabricated Prices · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.15 LIVE VALIDATION · Automatic Real Odds · Action Network Public Props · No Fabricated Prices · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
