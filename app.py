@@ -2365,12 +2365,21 @@ def _persist_validation_snapshots():
 
 
 def save_projection_snapshot(pitcher,proj,state=None,selected_date=None):
-    """Freeze the FIRST model projection seen for this pitcher/game."""
+    """Freeze the pregame projection used for validation.
+
+    A full pitcher-page analysis may replace an AUTO provisional snapshot while
+    the game is still pregame. Once the game is live/final, the snapshot is immutable.
+    """
     store=validation_snapshots()
     key=f"{pitcher.get('game_pk')}:{pitcher.get('pitcher_id')}"
-    if key not in store:
-        state=state or {}
-        timing=("FINAL" if state.get("is_final") else ("LIVE" if state.get("is_live") else "PREGAME"))
+    state=state or {}
+    timing=("FINAL" if state.get("is_final") else ("LIVE" if state.get("is_live") else "PREGAME"))
+    existing=store.get(key)
+    may_replace=(
+        existing is None or
+        (timing=="PREGAME" and existing.get("snapshot_timing")=="PREGAME" and existing.get("snapshot_source")=="AUTO")
+    )
+    if may_replace:
         store[key]={
             "game_pk":pitcher.get("game_pk"),
             "pitcher_id":pitcher.get("pitcher_id"),
@@ -2381,8 +2390,12 @@ def save_projection_snapshot(pitcher,proj,state=None,selected_date=None):
             "projected_k":safe_num(proj.get("central")),
             "projected_bf":safe_num(proj.get("bf")),
             "projected_k_pct":safe_num(proj.get("k_pct")),
+            "projected_low":safe_num(proj.get("low")),
+            "projected_high":safe_num(proj.get("high")),
             "snapshot_timing":timing,
-            "model_version":"V3.2.7",
+            "snapshot_source":"FULL_ANALYSIS",
+            "lineup_confirmed":True if proj.get("lineup_confirmed") else False,
+            "model_version":"V3.2.13",
             "game_date":str(selected_date) if selected_date is not None else None,
             "captured_at_utc":datetime.now(timezone.utc).isoformat(),
         }
@@ -2459,6 +2472,229 @@ def slate_status(option,selected_date):
     complete=all(snap.get(x) is not None for x in ("K%","K/start","BF/start"))
     return ("LISTO","dot-green",snap) if complete else ("PARCIAL","dot-gold",snap)
 
+
+# ============================================================
+# AUTOMATIC SLATE PROJECTIONS + RECORDS
+# ============================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def automatic_projection_for_option(option_json:str, selected_date_iso:str):
+    """Compute the SAME quantitative core used on the pitcher page, automatically.
+
+    This intentionally excludes M9/odds and explanatory-only cross-checks. It uses
+    only cutoff-safe pregame inputs needed by build_projection + leash adjustment.
+    """
+    opt=json.loads(option_json)
+    selected_date=date.fromisoformat(selected_date_iso)
+    cutoff_str=game_cutoff(selected_date).isoformat()
+
+    try:
+        mlb=pitcher_stats_to_date(int(opt["pitcher_id"]),selected_date.year,cutoff_str)
+    except Exception:
+        mlb={}
+    try:
+        log=pitcher_game_log_before(int(opt["pitcher_id"]),selected_date.year,selected_date.isoformat())
+    except Exception:
+        log=[]
+
+    sit="vl" if str(opt.get("throwing_hand","")).lower().startswith("left") else "vr"
+    try:
+        team_general=team_hitting_to_date(int(opt["opponent_id"]),selected_date.year,cutoff_str)
+    except Exception:
+        team_general={}
+    try:
+        team_split=team_hitting_to_date(int(opt["opponent_id"]),selected_date.year,cutoff_str,sit)
+    except Exception:
+        team_split={}
+
+    sc_start=f"{selected_date.year}-03-01"
+    try:
+        sc_pitcher=pitcher_statcast(int(opt["pitcher_id"]),sc_start,cutoff_str)
+    except Exception:
+        sc_pitcher=pd.DataFrame()
+    pdisc=plate_discipline(sc_pitcher) if isinstance(sc_pitcher,pd.DataFrame) else {}
+
+    try:
+        feed=game_feed(int(opt["game_pk"]))
+    except Exception:
+        feed={}
+    raw_lineup, lineup_guard_status = confirmed_lineup(
+        feed,
+        opt.get("opponent_side"),
+        opt.get("opponent_id"),
+        selected_date.year,
+        selected_date.isoformat(),
+    )
+    lineup_confirmed=bool(len(raw_lineup)==9 and str(lineup_guard_status).startswith("VERIFIED"))
+    try:
+        lineup=enrich_lineup(raw_lineup,selected_date.year,cutoff_str,opt.get("throwing_hand")) if raw_lineup else []
+    except Exception:
+        lineup=[]
+    lineup_prior_k=(
+        safe_num(team_split.get("calc_k_pct"))
+        or safe_num(team_general.get("calc_k_pct"))
+        or LINEUP_K_DEFAULT_PRIOR
+    )
+    lineup=apply_lineup_sample_size_protection(lineup,lineup_prior_k)
+
+    recent=recent_summary(log)
+    try:
+        park_so,_=park_so_factor(opt.get("venue"),selected_date.year)
+    except Exception:
+        park_so=100
+    auto_leash=automatic_leash_intelligence(int(opt["pitcher_id"]),selected_date,log,recent)
+
+    proj=build_projection(mlb,pdisc,team_general,team_split,lineup,recent,park_so)
+    proj=apply_leash_adjustment(proj,recent,auto_leash)
+    proj["lineup_confirmed"]=lineup_confirmed
+    proj["lineup_guard_status"]=lineup_guard_status
+    return proj
+
+
+def save_auto_projection_snapshot(pitcher,proj,state=None,selected_date=None):
+    """Create/update AUTO projection only while the game is still pregame.
+
+    Provisional snapshots may improve when the official 9-man lineup becomes
+    available. They never get created or changed after first pitch.
+    """
+    state=state or {}
+    if state.get("is_live") or state.get("is_final"):
+        return projection_snapshot(pitcher.get("game_pk"),pitcher.get("pitcher_id"))
+
+    store=validation_snapshots()
+    key=f"{pitcher.get('game_pk')}:{pitcher.get('pitcher_id')}"
+    existing=store.get(key)
+    if existing and existing.get("snapshot_source") not in (None,"AUTO"):
+        return existing
+
+    new_confirmed=bool(proj.get("lineup_confirmed"))
+    old_confirmed=bool(existing.get("lineup_confirmed")) if existing else False
+    # If we already have a confirmed-lineup pregame AUTO snapshot, keep it frozen.
+    if existing and old_confirmed:
+        return existing
+
+    store[key]={
+        "game_pk":pitcher.get("game_pk"),
+        "pitcher_id":pitcher.get("pitcher_id"),
+        "pitcher_name":pitcher.get("pitcher_name"),
+        "team":pitcher.get("team"),
+        "team_id":pitcher.get("team_id"),
+        "opponent":pitcher.get("opponent"),
+        "projected_k":safe_num(proj.get("central")),
+        "projected_bf":safe_num(proj.get("bf")),
+        "projected_k_pct":safe_num(proj.get("k_pct")),
+        "projected_low":safe_num(proj.get("low")),
+        "projected_high":safe_num(proj.get("high")),
+        "snapshot_timing":"PREGAME",
+        "snapshot_source":"AUTO",
+        "lineup_confirmed":new_confirmed,
+        "lineup_guard_status":proj.get("lineup_guard_status"),
+        "model_version":"V3.2.13",
+        "game_date":str(selected_date) if selected_date is not None else None,
+        "captured_at_utc":datetime.now(timezone.utc).isoformat(),
+    }
+    _persist_validation_snapshots()
+    return store[key]
+
+
+def ensure_automatic_slate_projections(options, selected_date):
+    """Populate MODEL K for all starters automatically without postgame leakage."""
+    eligible=[]
+    for opt in options:
+        state=live_game_state(opt.get("game_pk"))
+        if state.get("is_live") or state.get("is_final"):
+            continue
+        snap=projection_snapshot(opt.get("game_pk"),opt.get("pitcher_id"))
+        # Re-check provisional AUTO snapshots until the confirmed lineup arrives.
+        if snap is None or (snap.get("snapshot_source")=="AUTO" and not snap.get("lineup_confirmed")):
+            eligible.append(opt)
+
+    if not eligible:
+        return 0,0
+
+    done=0
+    failed=0
+    progress=st.progress(0,text=f"Generando proyecciones automáticas 0/{len(eligible)}")
+    for i,opt in enumerate(eligible,1):
+        try:
+            payload=json.dumps(opt,sort_keys=True,default=str)
+            proj=automatic_projection_for_option(payload,selected_date.isoformat())
+            save_auto_projection_snapshot(opt,proj,live_game_state(opt.get("game_pk")),selected_date.isoformat())
+            done+=1
+        except Exception:
+            failed+=1
+        progress.progress(i/len(eligible),text=f"Generando proyecciones automáticas {i}/{len(eligible)}")
+    progress.empty()
+    return done,failed
+
+
+def validation_record_rows():
+    """Build historical projection record and update actual K from MLB when available."""
+    rows=[]
+    for snap in validation_snapshots().values():
+        gp=safe_num(snap.get("game_pk")); pid=safe_num(snap.get("pitcher_id"))
+        if gp is None or pid is None:
+            continue
+        state=live_game_state(int(gp))
+        actual=(state.get("pitcher_ks") or {}).get(int(pid))
+        proj=safe_num(snap.get("projected_k"))
+        low=safe_num(snap.get("projected_low")); high=safe_num(snap.get("projected_high"))
+        result="PENDING"
+        if state.get("is_final") and actual is not None:
+            if low is not None and high is not None:
+                result="HIT" if low <= actual <= high else "MISS"
+            elif proj is not None:
+                result="HIT" if abs(actual-proj) <= 1.5 else "MISS"
+        rows.append({
+            "Date":snap.get("game_date"),
+            "Pitcher":snap.get("pitcher_name"),
+            "Matchup":f"{snap.get('team','')} vs {snap.get('opponent','')}",
+            "Model K":round(proj,2) if proj is not None else None,
+            "Range":f"{low:.1f}–{high:.1f}" if low is not None and high is not None else "—",
+            "Actual K":actual,
+            "Error K":round(actual-proj,2) if actual is not None and proj is not None else None,
+            "Result":result,
+            "Lineup":("CONFIRMED" if snap.get("lineup_confirmed") else "PROVISIONAL"),
+            "Source":snap.get("snapshot_source","—"),
+            "Version":snap.get("model_version","—"),
+        })
+    return rows
+
+
+def render_records_section():
+    st.markdown("## 📊 Récord de proyecciones")
+    rows=validation_record_rows()
+    if not rows:
+        st.info("Todavía no hay proyecciones guardadas.")
+        return
+    df=pd.DataFrame(rows)
+    final=df[df["Result"].isin(["HIT","MISS"])].copy()
+    hits=int((final["Result"]=="HIT").sum()) if not final.empty else 0
+    misses=int((final["Result"]=="MISS").sum()) if not final.empty else 0
+    total=hits+misses
+    pending=int((df["Result"]=="PENDING").sum())
+    mae=None
+    if not final.empty:
+        vals=pd.to_numeric(final["Error K"],errors="coerce").dropna().abs()
+        if not vals.empty: mae=float(vals.mean())
+
+    a,b,c,d=st.columns(4)
+    a.metric("Récord",f"{hits}-{misses}")
+    b.metric("Hit rate",f"{(hits/total*100):.1f}%" if total else "N/A")
+    c.metric("MAE",f"{mae:.2f} K" if mae is not None else "N/A")
+    d.metric("Pendientes",pending)
+
+    st.caption("HIT = los K reales terminaron dentro del rango probable pregame del modelo. MISS = terminaron fuera del rango. El error conserva además la diferencia exacta contra la proyección central.")
+    show=df.sort_values(["Date","Pitcher"],ascending=[False,True])
+    st.dataframe(show,hide_index=True,use_container_width=True)
+    st.download_button(
+        "Descargar récord CSV",
+        data=show.to_csv(index=False).encode("utf-8"),
+        file_name="mlb_strikeout_model_records.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
 # ============================================================
 # APP LOAD
 # ============================================================
@@ -2469,7 +2705,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.12 LIVE VALIDATION · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.2.13 LIVE VALIDATION · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2479,9 +2715,15 @@ if "view_mode" not in st.session_state:
 if "selected_pitcher_id" not in st.session_state:
     st.session_state["selected_pitcher_id"]=None
 
-date_col,_=st.columns([1.15,2.0])
+date_col,records_col,_=st.columns([1.15,.85,1.15])
 with date_col:
     game_date=st.date_input("Fecha",value=date.today(),min_value=date(2015,1,1),key="slate_date")
+with records_col:
+    st.write("")
+    st.write("")
+    if st.button("📊 RÉCORDS",use_container_width=True):
+        st.session_state["view_mode"]="records"
+        st.query_params.clear()
 
 try:
     options=pitchers_for_date(game_date.isoformat())
@@ -2503,7 +2745,19 @@ if qp_pitch and qp_pitch in by_id:
     st.session_state["selected_pitcher_id"]=qp_pitch
     st.session_state["view_mode"]="analysis"
 
+if st.session_state["view_mode"]=="records":
+    if st.button("← SLATE",use_container_width=False):
+        st.session_state["view_mode"]="slate"
+        st.rerun()
+    render_records_section()
+    st.stop()
+
 if st.session_state["view_mode"]=="slate":
+    # Automatically generate/freeze pregame MODEL K for every starter. Missing
+    # projections are never backfilled once a game has started.
+    auto_done,auto_failed=ensure_automatic_slate_projections(options,game_date)
+    if auto_failed:
+        st.caption(f"Auto projection: {auto_done} creadas/actualizadas · {auto_failed} no disponibles todavía.")
     games=slate_games(options)
     st.markdown(
         f"""
@@ -2772,6 +3026,7 @@ with st.spinner("Cargando y cruzando fuentes pregame..."):
 
 proj=build_projection(mlb,pdisc,team_general,team_split,lineup,recent,park_so)
 proj=apply_leash_adjustment(proj,recent,auto_leash)
+proj["lineup_confirmed"]=bool(len(raw_lineup)==9 and str(lineup_guard_status).startswith("VERIFIED"))
 
 # Freeze the first projection generated for this pitcher/game for live validation.
 validation_state=live_game_state(p.get("game_pk"))
@@ -2795,7 +3050,7 @@ with tab_summary:
     c.metric("Strikeouts proyectados",fmt(proj["central"],2))
     d.metric("Rango probable",f"{proj['low']:.1f}–{proj['high']:.1f}")
     if projection_snapshot_saved:
-        st.caption(f"Validation snapshot: {projection_snapshot_saved.get('projected_k',0):.2f} K · {projection_snapshot_saved.get('snapshot_timing','PREGAME')} · {projection_snapshot_saved.get('model_version','V3.2.7')}")
+        st.caption(f"Validation snapshot: {projection_snapshot_saved.get('projected_k',0):.2f} K · {projection_snapshot_saved.get('snapshot_timing','PREGAME')} · {projection_snapshot_saved.get('model_version','V3.2.13')}")
 
     st.subheader("Probabilidad por umbral")
     dist=[]
@@ -3260,4 +3515,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.12 LIVE VALIDATION · Automatic Real Odds · Action Network Public Props · No Fabricated Prices · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.2.13 LIVE VALIDATION · Automatic Real Odds · Action Network Public Props · No Fabricated Prices · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
