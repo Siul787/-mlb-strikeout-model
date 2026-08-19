@@ -31,7 +31,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.2.15 LIVE BOARD VALIDATION
+# V3.3.1 DUAL LAB + OFFICIAL RECORDS
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -2403,7 +2403,7 @@ def save_projection_snapshot(pitcher,proj,state=None,selected_date=None):
             "lineup_confirmed":True if proj.get("lineup_confirmed") else False,
             "analysis_ready":True if proj.get("analysis_ready") else False,
             "module_status":proj.get("module_status",{}),
-            "model_version":"V3.2.15",
+            "model_version":"V3.3.1",
             "game_date":str(selected_date) if selected_date is not None else None,
             "captured_at_utc":datetime.now(timezone.utc).isoformat(),
         }
@@ -2685,7 +2685,7 @@ def save_auto_projection_snapshot(pitcher,proj,state=None,selected_date=None):
         "analysis_ready":new_ready,
         "module_status":proj.get("module_status",{}),
         "lineup_guard_status":proj.get("lineup_guard_status"),
-        "model_version":"V3.2.15",
+        "model_version":"V3.3.1",
         "game_date":str(selected_date) if selected_date is not None else None,
         "captured_at_utc":datetime.now(timezone.utc).isoformat(),
     }
@@ -2736,13 +2736,69 @@ def purge_provisional_snapshots():
     return len(bad)
 
 
+def _format_k_pick(market,line):
+    market=str(market or "").strip()
+    x=safe_num(line)
+    if not market:
+        return "—"
+    if "alt" in market.lower() or "+" in market:
+        return market
+    return f"{market} {x:g} K" if x is not None else market
+
+
+def _grade_k_pick(actual,market,line):
+    a=safe_num(actual); x=safe_num(line); m=str(market or "").lower()
+    if a is None or x is None or not m:
+        return "PENDING"
+    if "alt" in m or "+" in m:
+        return "WIN" if a >= x else "LOSS"
+    if m.startswith("over"):
+        if a > x:return "WIN"
+        if a == x:return "PUSH"
+        return "LOSS"
+    if m.startswith("under"):
+        if a < x:return "WIN"
+        if a == x:return "PUSH"
+        return "LOSS"
+    return "PENDING"
+
+
+def attach_strikeout_pick_to_snapshot(pitcher,best,decision,grade):
+    """Attach the official sportsbook decision to an already frozen MODEL K snapshot.
+
+    The quantitative projection is frozen independently of M9. When verified odds
+    later produce an actionable pick, the same record row is enriched rather than
+    creating a second record.
+    """
+    if not best or not decision or str(decision).startswith(("PASS","ESPERAR")):
+        return
+    store=validation_snapshots()
+    key=f"{pitcher.get('game_pk')}:{pitcher.get('pitcher_id')}"
+    snap=store.get(key)
+    if not snap or not (snap.get("lineup_confirmed") and snap.get("analysis_ready")):
+        return
+    # Never change a pick after first pitch.
+    state=live_game_state(int(pitcher.get("game_pk")))
+    if state.get("is_live") or state.get("is_final"):
+        return
+    snap.update({
+        "pick_market":best.get("Market"),
+        "pick_line":safe_num(best.get("Line")),
+        "pick_odds":safe_num(best.get("Odds")),
+        "pick_sportsbook":best.get("Sportsbook"),
+        "pick_model_prob":safe_num(best.get("Model%")),
+        "pick_edge_pp":safe_num(best.get("Edge pp")),
+        "pick_ev_pct":safe_num(best.get("EV%")),
+        "pick_grade":grade,
+        "pick_captured_at_utc":datetime.now(timezone.utc).isoformat(),
+    })
+    _persist_validation_snapshots()
+
+
 def validation_record_rows():
-    """Build historical projection record and update actual K from MLB when available."""
+    """Build official K record: prediction first, then auto-update final result/W-L-P."""
     rows=[]
     for snap in validation_snapshots().values():
-        # Records only include official pregame projections made with verified lineup
-        # and all quantitative modules M1-M8 complete. Older provisional snapshots
-        # are intentionally excluded from the official record.
         if not (snap.get("lineup_confirmed") and snap.get("analysis_ready")):
             continue
         gp=safe_num(snap.get("game_pk")); pid=safe_num(snap.get("pitcher_id"))
@@ -2752,65 +2808,495 @@ def validation_record_rows():
         actual=(state.get("pitcher_ks") or {}).get(int(pid))
         proj=safe_num(snap.get("projected_k"))
         low=safe_num(snap.get("projected_low")); high=safe_num(snap.get("projected_high"))
-        result="PENDING"
+        market=snap.get("pick_market"); line=safe_num(snap.get("pick_line"))
+        bet_result="PENDING"
+        if state.get("is_final") and actual is not None:
+            bet_result=_grade_k_pick(actual,market,line) if market and line is not None else "NO PICK"
+        elif not market:
+            bet_result="AWAITING MARKET"
+        accuracy="PENDING"
         if state.get("is_final") and actual is not None:
             if low is not None and high is not None:
-                result="HIT" if low <= actual <= high else "MISS"
+                accuracy="HIT" if low <= actual <= high else "MISS"
             elif proj is not None:
-                result="HIT" if abs(actual-proj) <= 1.5 else "MISS"
+                accuracy="HIT" if abs(actual-proj)<=1.5 else "MISS"
         rows.append({
             "Date":snap.get("game_date"),
             "Pitcher":snap.get("pitcher_name"),
             "Matchup":f"{snap.get('team','')} vs {snap.get('opponent','')}",
             "Model K":round(proj,2) if proj is not None else None,
             "Range":f"{low:.1f}–{high:.1f}" if low is not None and high is not None else "—",
+            "Pick":_format_k_pick(market,line),
+            "Sportsbook":snap.get("pick_sportsbook") or "—",
+            "Odds":int(snap.get("pick_odds")) if safe_num(snap.get("pick_odds")) is not None else None,
             "Actual K":actual,
+            "Result":bet_result,
+            "Projection Accuracy":accuracy,
             "Error K":round(actual-proj,2) if actual is not None and proj is not None else None,
-            "Result":result,
-            "Lineup":"CONFIRMED · 100%",
-            "Source":snap.get("snapshot_source","—"),
+            "Grade":snap.get("pick_grade") or "—",
+            "Captured":snap.get("captured_at_utc"),
             "Version":snap.get("model_version","—"),
         })
     return rows
 
 
 def render_records_section():
-    st.markdown("## 📊 Récord de proyecciones")
+    st.markdown("## 📊 Strikeout Records")
+    st.caption("La fila entra aquí inmediatamente cuando MODEL K queda oficial (lineup 9/9 + M1–M8 100%). Si M9 encuentra una jugada real, la misma fila añade Pick/Odds. Al finalizar MLB añade Actual K y WIN/LOSS/PUSH automáticamente.")
     rows=validation_record_rows()
     if not rows:
-        st.info("Todavía no hay proyecciones guardadas.")
+        st.info("Todavía no hay proyecciones oficiales guardadas.")
         return
     df=pd.DataFrame(rows)
-    final=df[df["Result"].isin(["HIT","MISS"])].copy()
-    hits=int((final["Result"]=="HIT").sum()) if not final.empty else 0
-    misses=int((final["Result"]=="MISS").sum()) if not final.empty else 0
-    total=hits+misses
-    pending=int((df["Result"]=="PENDING").sum())
+    settled=df[df["Result"].isin(["WIN","LOSS","PUSH"])].copy()
+    wins=int((settled["Result"]=="WIN").sum()) if not settled.empty else 0
+    losses=int((settled["Result"]=="LOSS").sum()) if not settled.empty else 0
+    pushes=int((settled["Result"]=="PUSH").sum()) if not settled.empty else 0
+    graded=wins+losses
+    pending=int((~df["Result"].isin(["WIN","LOSS","PUSH","NO PICK"])).sum())
     mae=None
-    if not final.empty:
-        vals=pd.to_numeric(final["Error K"],errors="coerce").dropna().abs()
-        if not vals.empty: mae=float(vals.mean())
-
-    a,b,c,d=st.columns(4)
-    a.metric("Récord",f"{hits}-{misses}")
-    b.metric("Hit rate",f"{(hits/total*100):.1f}%" if total else "N/A")
+    finals=df[pd.to_numeric(df["Actual K"],errors="coerce").notna()].copy()
+    if not finals.empty:
+        vals=pd.to_numeric(finals["Error K"],errors="coerce").dropna().abs()
+        if not vals.empty:mae=float(vals.mean())
+    a,b,c,d,e=st.columns(5)
+    a.metric("Récord",f"{wins}-{losses}-{pushes}")
+    b.metric("Win rate",f"{(wins/graded*100):.1f}%" if graded else "N/A")
     c.metric("MAE",f"{mae:.2f} K" if mae is not None else "N/A")
     d.metric("Pendientes",pending)
-
-    st.caption("Solo cuentan proyecciones oficiales con lineup confirmado + M1-M8 al 100%. HIT = los K reales terminaron dentro del rango probable pregame del modelo. MISS = terminaron fuera del rango. El error conserva además la diferencia exacta contra la proyección central.")
+    e.metric("Proyecciones",len(df))
     show=df.sort_values(["Date","Pitcher"],ascending=[False,True])
     st.dataframe(show,hide_index=True,use_container_width=True)
-    st.download_button(
-        "Descargar récord CSV",
-        data=show.to_csv(index=False).encode("utf-8"),
-        file_name="mlb_strikeout_model_records.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+    st.download_button("Descargar Strikeout Records CSV",data=show.to_csv(index=False).encode("utf-8"),file_name="mlb_strikeout_records.csv",mime="text/csv",use_container_width=True)
+
+
+# ============================================================
+# MLB TOTALS LAB V1.0 — OVER / UNDER
+# Integrated as a separate engine from the strikeout model.
+# ============================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def totals_team_stats_range(team_id:int, season:int, group:str, start_date:str, end_date:str, sit_code:str|None=None):
+    params={"stats":"byDateRange","group":group,"startDate":start_date,"endDate":end_date}
+    if sit_code:
+        params["sitCodes"]=sit_code
+    try:
+        d=get_json(f"{MLB_TEAMS_URL}/{int(team_id)}/stats",params=params)
+        groups=d.get("stats",[]) or []
+        splits=(groups[0].get("splits",[]) if groups else []) or []
+        return splits[0].get("stat",{}) if splits else {}
+    except Exception:
+        return {}
+
+
+def _date_days_before(d:date,days:int):
+    return (d-timedelta(days=days)).isoformat()
+
+
+def _rate(n,d,mult=1.0):
+    a=safe_num(n); b=safe_num(d)
+    return (a/b*mult) if a is not None and b not in (None,0) else None
+
+
+def _ops_from(stat:dict):
+    v=safe_num(stat.get("ops"))
+    if v is not None:return v
+    obp=safe_num(stat.get("obp") or stat.get("onBasePercentage"))
+    slg=safe_num(stat.get("slg") or stat.get("sluggingPercentage"))
+    return (obp+slg) if obp is not None and slg is not None else None
+
+
+def totals_pitcher_view(opt:dict,selected_date:date):
+    cutoff=game_cutoff(selected_date).isoformat()
+    pid=int(opt["pitcher_id"])
+    season=selected_date.year
+    stt=pitcher_stats_to_date(pid,season,cutoff)
+    log=pitcher_game_log_before(pid,season,selected_date.isoformat())
+    recent5=log[:5]
+    rip=sum(innings_decimal(x.get("IP")) or 0 for x in recent5)
+    rer=sum(safe_num(x.get("ER")) or 0 for x in recent5)
+    recent_era=(rer*9/rip) if rip else None
+    return {
+        "Name":opt.get("pitcher_name"),
+        "ERA":safe_num(stt.get("era")),"WHIP":safe_num(stt.get("whip")),
+        "K%":safe_num(stt.get("calc_k_pct")),"BB%":safe_num(stt.get("calc_bb_pct")),
+        "HR/9":safe_num(stt.get("homeRunsPer9")),"BABIP":safe_num(stt.get("babip")),
+        "GB%":safe_num(stt.get("groundOutsToAirouts")),
+        "IP/start":safe_num(stt.get("calc_ip_start")),"K/start":safe_num(stt.get("calc_k_start")),
+        "Recent5 ERA":recent_era,"Recent5":recent5,
+        "Raw":stt,
+    }
+
+
+def totals_offense_view(team_id:int,selected_date:date,sit_code:str|None=None):
+    season=selected_date.year; cutoff=game_cutoff(selected_date).isoformat()
+    stt=totals_team_stats_range(team_id,season,"hitting",f"{season}-03-01",cutoff,sit_code)
+    g=safe_num(stt.get("gamesPlayed")); runs=safe_num(stt.get("runs")); pa=safe_num(stt.get("plateAppearances"))
+    so=safe_num(stt.get("strikeOuts")); bb=safe_num(stt.get("baseOnBalls"))
+    return {
+        "R/G":_rate(runs,g),"AVG":safe_num(stt.get("avg")),"OBP":safe_num(stt.get("obp")),
+        "SLG":safe_num(stt.get("slg")),"OPS":_ops_from(stt),"BABIP":safe_num(stt.get("babip")),
+        "K%":_rate(so,pa,100),"BB%":_rate(bb,pa,100),"RBI":safe_num(stt.get("rbi")),
+        "Raw":stt,
+    }
+
+
+def totals_bullpen_view(team_id:int,selected_date:date):
+    season=selected_date.year; cutoff=game_cutoff(selected_date).isoformat()
+    # MLB StatsAPI supports relief-pitcher situation codes on most dates. If the
+    # endpoint omits it, we explicitly label the fallback as a team-pitching proxy.
+    rp=totals_team_stats_range(team_id,season,"pitching",f"{season}-03-01",cutoff,"rp")
+    source="MLB relief split"
+    if not rp:
+        rp=totals_team_stats_range(team_id,season,"pitching",f"{season}-03-01",cutoff)
+        source="MLB team pitching proxy"
+    ip=innings_decimal(rp.get("inningsPitched")); so=safe_num(rp.get("strikeOuts")); bb=safe_num(rp.get("baseOnBalls")); bf=safe_num(rp.get("battersFaced"))
+    recent3=totals_team_stats_range(team_id,season,"pitching",_date_days_before(selected_date,3),cutoff,"rp")
+    recent7=totals_team_stats_range(team_id,season,"pitching",_date_days_before(selected_date,7),cutoff,"rp")
+    return {
+        "ERA":safe_num(rp.get("era")),"WHIP":safe_num(rp.get("whip")),"K%":_rate(so,bf,100),"BB%":_rate(bb,bf,100),
+        "HR/9":safe_num(rp.get("homeRunsPer9")),"Save%":safe_num(rp.get("savePercentage")),
+        "Blown Saves":safe_num(rp.get("blownSaves")),"Holds":safe_num(rp.get("holds")),
+        "IP L3":innings_decimal(recent3.get("inningsPitched")),"IP L7":innings_decimal(recent7.get("inningsPitched")),
+        "Source":source,"Raw":rp,
+    }
+
+
+def totals_weather_signal(ctx:dict):
+    temp=safe_num(ctx.get("temperature")); wind=str(ctx.get("wind") or "").lower()
+    mph=safe_num(re.search(r"(\d+(?:\.\d+)?)",wind).group(1)) if re.search(r"(\d+(?:\.\d+)?)",wind) else None
+    if temp is not None and temp>=82 and ("out" in wind or "out to" in wind):return "OVER",7
+    if mph is not None and mph>=10 and "in" in wind:return "UNDER",7
+    if temp is not None and temp<=55:return "UNDER",6
+    return "NEUTRAL",5
+
+
+def _signal_from_value(value,under_cut,over_cut,confidence=6):
+    x=safe_num(value)
+    if x is None:return "PENDING",0
+    if x<=under_cut:return "UNDER",confidence
+    if x>=over_cut:return "OVER",confidence
+    return "NEUTRAL",5
+
+
+def totals_lineup_status(game_pk:int,game_opts:list,selected_date:date):
+    try:feed=game_feed(int(game_pk))
+    except Exception:return False,{},"GAME FEED UNAVAILABLE"
+    out={}; ok=True; notes=[]
+    for opt in game_opts:
+        rows,status=confirmed_lineup(feed,opt.get("team_side"),opt.get("team_id"),selected_date.year,selected_date.isoformat())
+        # For Totals we need each team's own batting order; confirmed_lineup's expected
+        # team must therefore be the side's team, not the opponent.
+        if not rows:
+            ok=False
+        out[opt.get("team_side")]=rows
+        notes.append(f"{opt.get('team')}: {status}")
+    return ok,out," | ".join(notes)
+
+
+def totals_initial_filter(total_line,over_odds,under_odds,both_starters,market_ready):
+    odds_ok=any(-125<=x<=115 for x in [safe_num(over_odds),safe_num(under_odds)] if x is not None)
+    line=safe_num(total_line)
+    preferred=line in (7.5,8,8.0,8.5,9,9.0) if line is not None else False
+    extreme=(line is not None and (line<=6.5 or line>=9.5))
+    return {
+        "Abridores confirmados":bool(both_starters),
+        "Cuota preferida":odds_ok,
+        "Total prioritario":preferred,
+        "Línea extrema":extreme,
+        "Mercado disponible":bool(market_ready),
+    }
+
+
+def totals_model_decision(signals:dict,total_line=None):
+    votes={"OVER":0,"UNDER":0,"NEUTRAL":0,"PENDING":0}
+    conf=[]
+    for v in signals.values():
+        side=v.get("side","PENDING"); votes[side]=votes.get(side,0)+1
+        if side in ("OVER","UNDER"):conf.append(v.get("confidence",5))
+    if votes["PENDING"]:
+        return {"pick":"NO BET","confidence":0,"votes":votes,"reason":"Hay módulos pendientes; no se congela decisión final."}
+    delta=votes["OVER"]-votes["UNDER"]
+    if abs(delta)<2:
+        pick="NO BET"
+    else:
+        pick="OVER" if delta>0 else "UNDER"
+    base=(sum(conf)/len(conf) if conf else 5)
+    strength=min(10,max(1,base+abs(delta)*0.45)) if pick!="NO BET" else min(6,base)
+    return {"pick":pick,"confidence":round(strength,1),"votes":votes,"reason":"V1.0 integra las señales direccionales de M1–M9; se calibrará con el récord real."}
+
+
+def _tot_metric(label,val,suffix="",dec=2):
+    x=safe_num(val)
+    st.metric(label,"N/A" if x is None else f"{x:.{dec}f}{suffix}")
+
+
+TOTALS_RECORD_FILE=Path("/tmp/mlb_totals_records_v1.json")
+
+def _load_totals_records():
+    try:
+        if TOTALS_RECORD_FILE.exists():
+            d=json.loads(TOTALS_RECORD_FILE.read_text())
+            return d if isinstance(d,dict) else {}
+    except Exception:
+        pass
+    return {}
+
+@st.cache_resource
+def totals_records():
+    return _load_totals_records()
+
+def _persist_totals_records():
+    try:
+        TOTALS_RECORD_FILE.write_text(json.dumps(totals_records(),ensure_ascii=False,indent=2,default=str))
+    except Exception:
+        pass
+
+def save_totals_official_record(game_pk,selected_date,away,home,total_line,over_odds,under_odds,final,signals):
+    """Freeze one official O/U pick after every module is complete. Never changes after first pitch."""
+    if final.get("pick") not in ("OVER","UNDER"):
+        return None
+    if any(v.get("side")=="PENDING" for v in signals.values()):
+        return None
+    state=live_game_state(int(game_pk))
+    if state.get("is_live") or state.get("is_final"):
+        return totals_records().get(str(game_pk))
+    line=safe_num(total_line)
+    if line is None or line<=0:
+        return None
+    odds=safe_num(over_odds if final.get("pick")=="OVER" else under_odds)
+    if odds is None or odds==0:
+        return None
+    key=str(game_pk); store=totals_records()
+    if key in store:
+        return store[key]
+    store[key]={
+        "game_pk":int(game_pk),"game_date":str(selected_date),
+        "away":away.get("team"),"home":home.get("team"),
+        "away_pitcher":away.get("pitcher_name"),"home_pitcher":home.get("pitcher_name"),
+        "pick":final.get("pick"),"line":line,"odds":int(odds),
+        "confidence":safe_num(final.get("confidence")),"votes":final.get("votes",{}),
+        "captured_at_utc":datetime.now(timezone.utc).isoformat(),
+        "model_version":"Totals V1.0 / App V3.3.1",
+    }
+    _persist_totals_records()
+    return store[key]
+
+def _grade_total_pick(actual,pick,line):
+    a=safe_num(actual); x=safe_num(line); p=str(pick or "").upper()
+    if a is None or x is None:return "PENDING"
+    if a==x:return "PUSH"
+    if p=="OVER":return "WIN" if a>x else "LOSS"
+    if p=="UNDER":return "WIN" if a<x else "LOSS"
+    return "PENDING"
+
+def totals_record_rows():
+    rows=[]
+    for rec in totals_records().values():
+        gp=safe_num(rec.get("game_pk"))
+        if gp is None:continue
+        state=live_game_state(int(gp))
+        total_actual=None
+        if state.get("is_live") or state.get("is_final"):
+            total_actual=(safe_num(state.get("away_runs")) or 0)+(safe_num(state.get("home_runs")) or 0)
+        result=_grade_total_pick(total_actual,rec.get("pick"),rec.get("line")) if state.get("is_final") else "PENDING"
+        rows.append({
+            "Date":rec.get("game_date"),"Game":f"{rec.get('away')} @ {rec.get('home')}",
+            "Pick":f"{rec.get('pick')} {safe_num(rec.get('line')):g}","Odds":rec.get("odds"),
+            "Confidence":rec.get("confidence"),"Final Runs":int(total_actual) if total_actual is not None and state.get("is_final") else None,
+            "Result":result,"Captured":rec.get("captured_at_utc"),"Version":rec.get("model_version"),
+        })
+    return rows
+
+def render_totals_records():
+    st.markdown("## 📊 Totals O/U Records")
+    st.caption("Cada pick oficial entra inmediatamente como PENDING. Cuando MLB marca el juego FINAL, se añade el total real y se califica WIN/LOSS/PUSH automáticamente.")
+    rows=totals_record_rows()
+    if not rows:
+        st.info("Todavía no hay picks oficiales de Totals guardados.")
+        return
+    df=pd.DataFrame(rows)
+    settled=df[df["Result"].isin(["WIN","LOSS","PUSH"])]
+    w=int((settled["Result"]=="WIN").sum()); l=int((settled["Result"]=="LOSS").sum()); psh=int((settled["Result"]=="PUSH").sum())
+    graded=w+l
+    a,b,c,d=st.columns(4)
+    a.metric("Récord",f"{w}-{l}-{psh}")
+    b.metric("Win rate",f"{w/graded*100:.1f}%" if graded else "N/A")
+    c.metric("Pendientes",int((df["Result"]=="PENDING").sum()))
+    d.metric("Picks",len(df))
+    show=df.sort_values(["Date","Game"],ascending=[False,True])
+    st.dataframe(show,hide_index=True,use_container_width=True)
+    st.download_button("Descargar Totals Records CSV",data=show.to_csv(index=False).encode("utf-8"),file_name="mlb_totals_records.csv",mime="text/csv",use_container_width=True)
+
+
+def render_totals_lab():
+    st.markdown("""
+    <div class="hero">
+      <div class="section-label">MODELO PROFESIONAL MLB · TOTALS</div>
+      <div style="font-size:2.05rem;font-weight:880;margin-top:3px">MLB Over / Under Lab</div>
+      <div style="opacity:.70;margin-top:6px">V1.0 · Filtro inicial + M1–M10 · Cutoff-safe · Sin mezclar con el motor de strikeouts</div>
+    </div>
+    """,unsafe_allow_html=True)
+
+    tdate_col,trec_col=st.columns([1.25,.75])
+    with tdate_col:
+        td=st.date_input("Fecha",value=date.today(),min_value=date(2015,1,1),key="totals_date")
+    with trec_col:
+        st.write("");st.write("")
+        if st.button("📊 RÉCORDS O/U",use_container_width=True,key="totals_records_btn"):
+            st.session_state["totals_show_records"]=True
+    if st.session_state.get("totals_show_records"):
+        if st.button("← TOTALS",key="back_totals_records"):
+            st.session_state["totals_show_records"]=False;st.rerun()
+        render_totals_records();return
+    try:opts=pitchers_for_date(td.isoformat())
+    except Exception as exc:
+        st.error(f"No se pudo cargar MLB: {exc}");return
+    games=slate_games(opts)
+    if not games:
+        st.warning("No hay juegos con abridores anunciados para esta fecha.");return
+
+    if "totals_game_pk" not in st.session_state:st.session_state["totals_game_pk"]=None
+    if st.session_state["totals_game_pk"] is None:
+        st.markdown(f"### Daily Totals Board · {td.strftime('%A · %B %d').upper()}")
+        cols=st.columns(3)
+        for i,g in enumerate(games):
+            if len(g)<2:continue
+            away=next((x for x in g if x.get("team_side")=="away"),g[0]); home=next((x for x in g if x.get("team_side")=="home"),g[-1])
+            state=live_game_state(away.get("game_pk"))
+            score=(f"{state.get('away_runs',0)}–{state.get('home_runs',0)}" if (state.get('is_live') or state.get('is_final')) else "—")
+            with cols[i%3]:
+                st.markdown(f"**{away['team']} @ {home['team']}**  \n{away['pitcher_name']} vs {home['pitcher_name']}  \n{away.get('game_time','TBD')} · {away.get('venue','')}  \nScore: **{score}**")
+                if st.button("ANALIZAR TOTAL",key=f"tot_{away['game_pk']}",use_container_width=True):
+                    st.session_state["totals_game_pk"]=int(away["game_pk"]);st.rerun()
+        return
+
+    gp=int(st.session_state["totals_game_pk"])
+    g=next((x for x in games if x and int(x[0].get("game_pk"))==gp),None)
+    if not g:
+        st.session_state["totals_game_pk"]=None;st.rerun()
+    if st.button("← TOTALS SLATE"):
+        st.session_state["totals_game_pk"]=None;st.rerun()
+    away=next((x for x in g if x.get("team_side")=="away"),g[0]); home=next((x for x in g if x.get("team_side")=="home"),g[-1])
+    st.markdown(f"## {away['team']} @ {home['team']}")
+    st.caption(f"{away['pitcher_name']} vs {home['pitcher_name']} · {away.get('venue')} · {away.get('game_time')}")
+
+    # Market input is isolated in M8. Until an automatic verified totals source is
+    # connected, missing values keep M8 pending instead of inventing prices.
+    st.markdown("### FILTRO INICIAL")
+    f1,f2,f3=st.columns(3)
+    total_line=f1.number_input("Total de la casa (0 = pendiente)",0.0,20.0,0.0,.5,key=f"totline_{gp}")
+    over_odds=f2.number_input("Over odds (0 = pendiente)",-1000,1000,0,1,key=f"overodds_{gp}")
+    under_odds=f3.number_input("Under odds (0 = pendiente)",-1000,1000,0,1,key=f"underodds_{gp}")
+    both_starters=len(g)>=2 and all(x.get("pitcher_id") for x in g[:2])
+    market_ready=total_line>0 and over_odds!=0 and under_odds!=0
+    filt=totals_initial_filter(total_line,over_odds,under_odds,both_starters,market_ready)
+    st.dataframe(pd.DataFrame([{"Criterio":k,"Estado":"OK" if v else "PENDIENTE"} for k,v in filt.items()]),hide_index=True,use_container_width=True)
+
+    cutoff=game_cutoff(td).isoformat(); season=td.year
+    ap=totals_pitcher_view(away,td); hp=totals_pitcher_view(home,td)
+    ao=totals_offense_view(away["team_id"],td); ho=totals_offense_view(home["team_id"],td)
+    ab=totals_bullpen_view(away["team_id"],td); hb=totals_bullpen_view(home["team_id"],td)
+    feed=game_feed(gp); ctx=game_context(feed)
+    lineup_ok,lineups,lineup_note=totals_lineup_status(gp,g,td)
+
+    signals={}
+    tabs=st.tabs(["M1 Abridores","M2 Bullpen","M3 Ofensiva","M4 Splits","M5 Parque","M6 Clima","M7 Umpire","M8 Mercado","M9 Lineups","M10 Final"])
+    with tabs[0]:
+        df=pd.DataFrame([{k:v for k,v in ap.items() if k not in ("Raw","Recent5")},{k:v for k,v in hp.items() if k not in ("Raw","Recent5")}])
+        st.dataframe(df,hide_index=True,use_container_width=True)
+        era_avg=weighted_average([(ap.get("ERA"),1),(hp.get("ERA"),1)])
+        side,conf=_signal_from_value(era_avg,3.65,4.55,7);signals["M1"]={"side":side,"confidence":conf}
+        st.info(f"M1: **{side}** · Confianza {conf}/10 · ERA combinada {fmt(era_avg,2)}")
+    with tabs[1]:
+        st.dataframe(pd.DataFrame([{"Team":away['team'],**ab},{"Team":home['team'],**hb}]).drop(columns=["Raw"],errors="ignore"),hide_index=True,use_container_width=True)
+        bp_era=weighted_average([(ab.get("ERA"),1),(hb.get("ERA"),1)])
+        side,conf=_signal_from_value(bp_era,3.65,4.55,6)
+        usage=(safe_num(ab.get("IP L3")) or 0)+(safe_num(hb.get("IP L3")) or 0)
+        if usage>=10 and side=="NEUTRAL":side,conf="OVER",6
+        signals["M2"]={"side":side,"confidence":conf};st.info(f"M2: **{side}** · Confianza {conf}/10")
+    with tabs[2]:
+        st.dataframe(pd.DataFrame([{"Team":away['team'],**{k:v for k,v in ao.items() if k!='Raw'}},{"Team":home['team'],**{k:v for k,v in ho.items() if k!='Raw'}}]),hide_index=True,use_container_width=True)
+        rg=(safe_num(ao.get("R/G")) or 0)+(safe_num(ho.get("R/G")) or 0)
+        side,conf=_signal_from_value(rg,8.0,9.2,7);signals["M3"]={"side":side,"confidence":conf};st.info(f"M3: **{side}** · Confianza {conf}/10 · R/G combinado {rg:.2f}")
+    with tabs[3]:
+        away_vs=totals_offense_view(away['team_id'],td,"vl" if str(home.get('throwing_hand','')).lower().startswith('left') else "vr")
+        home_vs=totals_offense_view(home['team_id'],td,"vl" if str(away.get('throwing_hand','')).lower().startswith('left') else "vr")
+        away_loc=totals_offense_view(away['team_id'],td,"away"); home_loc=totals_offense_view(home['team_id'],td,"home")
+        st.dataframe(pd.DataFrame([
+            {"Team":away['team'],"OPS vs hand":away_vs.get('OPS'),"R/G vs hand":away_vs.get('R/G'),"OPS loc":away_loc.get('OPS')},
+            {"Team":home['team'],"OPS vs hand":home_vs.get('OPS'),"R/G vs hand":home_vs.get('R/G'),"OPS loc":home_loc.get('OPS')},
+        ]),hide_index=True,use_container_width=True)
+        opsavg=weighted_average([(away_vs.get('OPS'),1),(home_vs.get('OPS'),1)])
+        side,conf=_signal_from_value(opsavg,.700,.760,6);signals["M4"]={"side":side,"confidence":conf};st.info(f"M4: **{side}** · Confianza {conf}/10")
+    with tabs[4]:
+        park_so,park_src=park_so_factor(away.get('venue'),season)
+        st.metric("Park Factor SO (contexto existente)",fmt(park_so,0));st.caption(park_src)
+        st.warning("Park Factor Runs/HR/Hits/2B/3B todavía requiere una fuente de park factors de totales. M5 queda PENDING; no se usa el SO factor como sustituto.")
+        signals["M5"]={"side":"PENDING","confidence":0}
+    with tabs[5]:
+        a,b,c=st.columns(3);a.metric("Temperature",str(ctx.get('temperature') or 'N/A'));b.metric("Wind",str(ctx.get('wind') or 'N/A'));c.metric("Condition",str(ctx.get('condition') or 'N/A'))
+        side,conf=totals_weather_signal(ctx);signals["M6"]={"side":side,"confidence":conf};st.info(f"M6: **{side}** · Confianza {conf}/10")
+    with tabs[6]:
+        st.metric("Home plate umpire",ctx.get('umpire') or 'PENDIENTE')
+        st.warning("Tendencia histórica O/U del umpire aún no tiene fuente automática verificada. M7 queda PENDING.")
+        signals["M7"]={"side":"PENDING","confidence":0}
+    with tabs[7]:
+        c1,c2,c3,c4=st.columns(4)
+        opening=c1.number_input("Opening total",0.0,20.0,0.0,.5,key=f"opentot_{gp}")
+        tickets_over=c2.number_input("% Tickets Over",0,100,0,1,key=f"to_{gp}")
+        money_over=c3.number_input("% Money Over",0,100,0,1,key=f"mo_{gp}")
+        steam=c4.checkbox("Steam Move",key=f"steam_{gp}")
+        rlm=st.checkbox("Reverse Line Movement",key=f"rlm_{gp}")
+        if market_ready:
+            move=(total_line-opening) if opening>0 else 0
+            side="NEUTRAL";conf=5
+            if money_over>=60 and tickets_over<=45:side,conf="OVER",7
+            elif money_over<=40 and tickets_over>=55:side,conf="UNDER",7
+            if opening>0 and move>=.5:side,conf="OVER",max(conf,6)
+            elif opening>0 and move<=-.5:side,conf="UNDER",max(conf,6)
+            signals["M8"]={"side":side,"confidence":conf}
+            st.info(f"M8: **{side}** · Confianza {conf}/10")
+        else:
+            signals["M8"]={"side":"PENDING","confidence":0};st.warning("M8 pendiente hasta tener Total + precios reales. Nunca se inventan odds.")
+    with tabs[8]:
+        if lineup_ok:
+            st.success("LINEUPS CONFIRMADOS 9/9 PARA AMBOS EQUIPOS")
+            st.caption(lineup_note)
+            for side_name,opt in (("away",away),("home",home)):
+                st.markdown(f"**{opt['team']}**")
+                st.dataframe(pd.DataFrame(lineups.get(side_name,[])),hide_index=True,use_container_width=True)
+            signals["M9"]={"side":"NEUTRAL","confidence":6}
+        else:
+            st.warning("M9 PENDING · No hay lineups oficiales 9/9 para ambos equipos.")
+            st.caption(lineup_note);signals["M9"]={"side":"PENDING","confidence":0}
+    with tabs[9]:
+        final=totals_model_decision(signals,total_line)
+        st.markdown("### Decisión final V1.0")
+        v=final['votes'];st.write(f"**Over:** {v['OVER']} · **Under:** {v['UNDER']} · **Neutral:** {v['NEUTRAL']} · **Pendientes:** {v['PENDING']}")
+        if final['pick']=="NO BET":
+            st.warning(f"**NO BET** · {final['reason']}")
+        else:
+            st.success(f"**PICK: {final['pick']} {total_line if total_line>0 else ''}** · Confianza **{final['confidence']}/10**")
+            saved_total=save_totals_official_record(gp,td,away,home,total_line,over_odds,under_odds,final,signals)
+            if saved_total:
+                st.caption("✅ Pick oficial congelado y enviado inmediatamente a RÉCORDS O/U.")
+        st.caption(final['reason'])
+
+    st.divider()
+    st.caption("MLB Totals Lab V1.0 · Pick oficial → RÉCORDS PENDING → FINAL MLB → WIN/LOSS/PUSH. Los módulos sin fuente automática verificada permanecen PENDING; nunca se inventan datos.")
+
 
 # ============================================================
 # APP LOAD
 # ============================================================
+
+# Dual-lab router. Totals is a separate engine; switching does not alter strikeout state.
+lab_mode=st.radio("Laboratorio",["⚾ Strikeouts","📈 Totals O/U"],horizontal=True,key="global_lab_mode",label_visibility="collapsed")
+if lab_mode=="📈 Totals O/U":
+    render_totals_lab()
+    st.stop()
+
 
 
 st.markdown(
@@ -2818,7 +3304,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.2.15 LIVE VALIDATION · Confirmed-Lineup 100% Gate · Official Snapshot Cleanup · Records Fix · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.3.1 DUAL LAB · OFFICIAL PICK RECORDS · STRIKEOUT ENGINE · Confirmed-Lineup 100% Gate · Official Snapshot Cleanup · Records Fix · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -2998,9 +3484,15 @@ if st.session_state["view_mode"]=="slate":
     st.markdown(board_html,unsafe_allow_html=True)
     st.markdown('<div class="board-legend">Horario en ET. Antes del juego el score aparece como —; al comenzar cambia automáticamente a 0-0 o al marcador real. MODEL K solo aparece cuando MLB confirma los 9 bateadores y M1-M8 están 100% completos; entonces queda congelado. LIVE/FINAL K llega de MLB. Toca el nombre del pitcher para abrir el análisis.</div>',unsafe_allow_html=True)
 
-    if any(live_game_state(g[0].get("game_pk")).get("is_live") for g in games if g):
+    _states=[live_game_state(g[0].get("game_pk")) for g in games if g]
+    if any(x.get("is_live") for x in _states):
         st.markdown('<meta http-equiv="refresh" content="30">',unsafe_allow_html=True)
-        st.caption("Live board: actualización automática cada 30 segundos mientras haya juegos en vivo.")
+        st.caption("Live board: actualización automática cada 30 segundos. Las proyecciones oficiales ya congeladas se conservan mientras LIVE K se actualiza desde MLB.")
+    elif game_date==date.today() and any(not x.get("is_final") for x in _states):
+        # Keep the pregame board polling while the user has it open. This lets the
+        # app detect MLB's 9/9 lineup confirmation and freeze MODEL K immediately.
+        st.markdown('<meta http-equiv="refresh" content="60">',unsafe_allow_html=True)
+        st.caption("Pregame watcher: revisando lineups oficiales cada 60 segundos. En cuanto MLB confirma 9/9 y M1–M8 llegan al 100%, MODEL K se congela y entra a RÉCORDS.")
     st.stop()
 
 selected_id=st.session_state["selected_pitcher_id"]
@@ -3512,6 +4004,16 @@ if 'market_df' in locals() and not market_df.empty:
     if not eligible.empty:
         best=eligible.sort_values("EV%",ascending=False).iloc[0].to_dict()
 
+# As soon as M1-M8 are official, MODEL K already exists in Records. If M9 also
+# produces an actionable verified price before first pitch, enrich that same row
+# with the official bet so final WIN/LOSS/PUSH can be graded automatically.
+if best and proj.get("lineup_confirmed") and proj.get("analysis_ready"):
+    _ev=safe_num(best.get("EV%")); _edge=safe_num(best.get("Edge pp"))
+    _grade=grade_bet((_ev/100 if _ev is not None else None),_edge,9)
+    if _ev is not None and _ev>=3 and _grade in ("A","B","C"):
+        _decision=f"{best['Market']} {best['Line']} · {best['Sportsbook']} {int(best['Odds']):+d}"
+        attach_strikeout_pick_to_snapshot(p,best,_decision,_grade)
+
 with tab_analysis:
     st.subheader("Analista IA · lectura conjunta")
     ai_state=ai_status()
@@ -3651,4 +4153,4 @@ with tab_sources:
         "Core projection inputs remain cutoff-safe. Fallbacks only fill a metric when the source is compatible with the selected pregame cutoff."
     )
 
-st.caption("V3.2.15 LIVE VALIDATION · Automatic Real Odds · Action Network Public Props · No Fabricated Prices · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
+st.caption("V3.3.1 LIVE VALIDATION · Automatic Real Odds · Action Network Public Props · No Fabricated Prices · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst · cutoff-safe quantitative engine.")
