@@ -31,7 +31,7 @@ from pybaseball import (
 
 # ============================================================
 # MODEL PROFESSIONAL MLB - STARTING PITCHER STRIKEOUTS
-# V3.3.1 DUAL LAB + OFFICIAL RECORDS
+# V3.4.0 MARKET HUB + IMMUTABLE RECORDS
 # ============================================================
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -2403,7 +2403,7 @@ def save_projection_snapshot(pitcher,proj,state=None,selected_date=None):
             "lineup_confirmed":True if proj.get("lineup_confirmed") else False,
             "analysis_ready":True if proj.get("analysis_ready") else False,
             "module_status":proj.get("module_status",{}),
-            "model_version":"V3.3.1",
+            "model_version":"V3.4.0",
             "game_date":str(selected_date) if selected_date is not None else None,
             "captured_at_utc":datetime.now(timezone.utc).isoformat(),
         }
@@ -2416,18 +2416,10 @@ def projection_snapshot(game_pk,pitcher_id):
 
 
 def official_projection_snapshot(game_pk,pitcher_id):
-    """Return only validation-eligible snapshots.
-
-    V3.2.13 could persist provisional AUTO projections before the official lineup.
-    Those rows must never appear as MODEL K or enter Records after the 100% gate.
-    """
+    """Return frozen official projection during PREGAME, LIVE, or FINAL."""
     snap=projection_snapshot(game_pk,pitcher_id)
-    if not snap:
-        return None
-    if not (snap.get("lineup_confirmed") and snap.get("analysis_ready")):
-        return None
-    if str(snap.get("snapshot_timing") or "").upper()!="PREGAME":
-        return None
+    if not snap:return None
+    if not (snap.get("lineup_confirmed") and snap.get("analysis_ready")):return None
     return snap
 
 
@@ -2476,6 +2468,23 @@ def live_game_state(game_pk:int):
         "inning_text":inning_text,"pitcher_ks":pitcher_ks,
     }
 
+
+
+def settle_validation_snapshots():
+    """Attach MLB final K to frozen MODEL K without changing the projection."""
+    store=validation_snapshots(); changed=False
+    for snap in store.values():
+        if not (snap.get("lineup_confirmed") and snap.get("analysis_ready")):continue
+        if snap.get("actual_k") is not None and snap.get("settled_at_utc"):continue
+        try:gp=int(snap.get("game_pk")); pid=int(snap.get("pitcher_id"))
+        except Exception:continue
+        state=live_game_state(gp)
+        if not state.get("is_final"):continue
+        actual=(state.get("pitcher_ks") or {}).get(pid)
+        if actual is None:continue
+        snap["actual_k"]=int(actual); snap["settled_at_utc"]=datetime.now(timezone.utc).isoformat(); changed=True
+    if changed:_persist_validation_snapshots()
+    return changed
 
 def slate_games(options):
     grouped={}
@@ -2685,7 +2694,7 @@ def save_auto_projection_snapshot(pitcher,proj,state=None,selected_date=None):
         "analysis_ready":new_ready,
         "module_status":proj.get("module_status",{}),
         "lineup_guard_status":proj.get("lineup_guard_status"),
-        "model_version":"V3.3.1",
+        "model_version":"V3.4.0",
         "game_date":str(selected_date) if selected_date is not None else None,
         "captured_at_utc":datetime.now(timezone.utc).isoformat(),
     }
@@ -2796,77 +2805,35 @@ def attach_strikeout_pick_to_snapshot(pitcher,best,decision,grade):
 
 
 def validation_record_rows():
-    """Build official K record: prediction first, then auto-update final result/W-L-P."""
-    rows=[]
+    """Projection record independent of whether a wager was placed."""
+    settle_validation_snapshots(); rows=[]
     for snap in validation_snapshots().values():
-        if not (snap.get("lineup_confirmed") and snap.get("analysis_ready")):
-            continue
+        if not (snap.get("lineup_confirmed") and snap.get("analysis_ready")):continue
         gp=safe_num(snap.get("game_pk")); pid=safe_num(snap.get("pitcher_id"))
-        if gp is None or pid is None:
-            continue
-        state=live_game_state(int(gp))
-        actual=(state.get("pitcher_ks") or {}).get(int(pid))
-        proj=safe_num(snap.get("projected_k"))
-        low=safe_num(snap.get("projected_low")); high=safe_num(snap.get("projected_high"))
-        market=snap.get("pick_market"); line=safe_num(snap.get("pick_line"))
-        bet_result="PENDING"
-        if state.get("is_final") and actual is not None:
-            bet_result=_grade_k_pick(actual,market,line) if market and line is not None else "NO PICK"
-        elif not market:
-            bet_result="AWAITING MARKET"
+        if gp is None or pid is None:continue
+        state=live_game_state(int(gp)); actual=safe_num(snap.get("actual_k"))
+        if actual is None:actual=(state.get("pitcher_ks") or {}).get(int(pid))
+        proj=safe_num(snap.get("projected_k")); low=safe_num(snap.get("projected_low")); high=safe_num(snap.get("projected_high"))
+        market=snap.get("pick_market"); line=safe_num(snap.get("pick_line")); bet_result="NO BET" if not market else "PENDING"
+        if state.get("is_final") and actual is not None and market and line is not None:bet_result=_grade_k_pick(actual,market,line)
         accuracy="PENDING"
         if state.get("is_final") and actual is not None:
-            if low is not None and high is not None:
-                accuracy="HIT" if low <= actual <= high else "MISS"
-            elif proj is not None:
-                accuracy="HIT" if abs(actual-proj)<=1.5 else "MISS"
-        rows.append({
-            "Date":snap.get("game_date"),
-            "Pitcher":snap.get("pitcher_name"),
-            "Matchup":f"{snap.get('team','')} vs {snap.get('opponent','')}",
-            "Model K":round(proj,2) if proj is not None else None,
-            "Range":f"{low:.1f}–{high:.1f}" if low is not None and high is not None else "—",
-            "Pick":_format_k_pick(market,line),
-            "Sportsbook":snap.get("pick_sportsbook") or "—",
-            "Odds":int(snap.get("pick_odds")) if safe_num(snap.get("pick_odds")) is not None else None,
-            "Actual K":actual,
-            "Result":bet_result,
-            "Projection Accuracy":accuracy,
-            "Error K":round(actual-proj,2) if actual is not None and proj is not None else None,
-            "Grade":snap.get("pick_grade") or "—",
-            "Captured":snap.get("captured_at_utc"),
-            "Version":snap.get("model_version","—"),
-        })
+            if low is not None and high is not None:accuracy="HIT" if low <= actual <= high else "MISS"
+            elif proj is not None:accuracy="HIT" if abs(actual-proj)<=1.5 else "MISS"
+        rows.append({"Date":snap.get("game_date"),"Pitcher":snap.get("pitcher_name"),"Matchup":f"{snap.get('team','')} vs {snap.get('opponent','')}","Model K":round(proj,2) if proj is not None else None,"Range":f"{low:.1f}–{high:.1f}" if low is not None and high is not None else "—","Actual K":int(actual) if actual is not None and state.get("is_final") else None,"Projection Result":accuracy,"Bet Pick":_format_k_pick(market,line),"Sportsbook":snap.get("pick_sportsbook") or "—","Odds":int(snap.get("pick_odds")) if safe_num(snap.get("pick_odds")) is not None else None,"Bet Result":bet_result,"Error K":round(actual-proj,2) if actual is not None and proj is not None and state.get("is_final") else None,"Captured":snap.get("captured_at_utc"),"Version":snap.get("model_version","—")})
     return rows
 
 
 def render_records_section():
     st.markdown("## 📊 Strikeout Records")
-    st.caption("La fila entra aquí inmediatamente cuando MODEL K queda oficial (lineup 9/9 + M1–M8 100%). Si M9 encuentra una jugada real, la misma fila añade Pick/Odds. Al finalizar MLB añade Actual K y WIN/LOSS/PUSH automáticamente.")
+    st.caption("Toda proyección oficial queda congelada al 100%. Al finalizar MLB se añade Actual K y el resultado automáticamente, haya apuesta o no.")
     rows=validation_record_rows()
-    if not rows:
-        st.info("Todavía no hay proyecciones oficiales guardadas.")
-        return
-    df=pd.DataFrame(rows)
-    settled=df[df["Result"].isin(["WIN","LOSS","PUSH"])].copy()
-    wins=int((settled["Result"]=="WIN").sum()) if not settled.empty else 0
-    losses=int((settled["Result"]=="LOSS").sum()) if not settled.empty else 0
-    pushes=int((settled["Result"]=="PUSH").sum()) if not settled.empty else 0
-    graded=wins+losses
-    pending=int((~df["Result"].isin(["WIN","LOSS","PUSH","NO PICK"])).sum())
-    mae=None
-    finals=df[pd.to_numeric(df["Actual K"],errors="coerce").notna()].copy()
-    if not finals.empty:
-        vals=pd.to_numeric(finals["Error K"],errors="coerce").dropna().abs()
-        if not vals.empty:mae=float(vals.mean())
-    a,b,c,d,e=st.columns(5)
-    a.metric("Récord",f"{wins}-{losses}-{pushes}")
-    b.metric("Win rate",f"{(wins/graded*100):.1f}%" if graded else "N/A")
-    c.metric("MAE",f"{mae:.2f} K" if mae is not None else "N/A")
-    d.metric("Pendientes",pending)
-    e.metric("Proyecciones",len(df))
-    show=df.sort_values(["Date","Pitcher"],ascending=[False,True])
-    st.dataframe(show,hide_index=True,use_container_width=True)
+    if not rows:st.info("Todavía no hay proyecciones oficiales guardadas.");return
+    df=pd.DataFrame(rows); settled=df[df["Projection Result"].isin(["HIT","MISS"])]
+    hits=int((settled["Projection Result"]=="HIT").sum()); misses=int((settled["Projection Result"]=="MISS").sum()); pending=int((df["Projection Result"]=="PENDING").sum())
+    vals=pd.to_numeric(df["Error K"],errors="coerce").dropna().abs(); mae=float(vals.mean()) if not vals.empty else None
+    a,b,c,d=st.columns(4); a.metric("Proyecciones",len(df)); b.metric("Hit / Miss",f"{hits}-{misses}" if hits+misses else "N/A"); c.metric("MAE",f"{mae:.2f} K" if mae is not None else "N/A"); d.metric("Pendientes",pending)
+    show=df.sort_values(["Date","Pitcher"],ascending=[False,True]); st.dataframe(show,hide_index=True,use_container_width=True)
     st.download_button("Descargar Strikeout Records CSV",data=show.to_csv(index=False).encode("utf-8"),file_name="mlb_strikeout_records.csv",mime="text/csv",use_container_width=True)
 
 
@@ -3077,7 +3044,7 @@ def save_totals_official_record(game_pk,selected_date,away,home,total_line,over_
         "pick":final.get("pick"),"line":line,"odds":int(odds),
         "confidence":safe_num(final.get("confidence")),"votes":final.get("votes",{}),
         "captured_at_utc":datetime.now(timezone.utc).isoformat(),
-        "model_version":"Totals V1.0 / App V3.3.1",
+        "model_version":"Team Totals V0.1 / App V3.4.0",
     }
     _persist_totals_records()
     return store[key]
@@ -3109,11 +3076,11 @@ def totals_record_rows():
     return rows
 
 def render_totals_records():
-    st.markdown("## 📊 Totals O/U Records")
+    st.markdown("## 📊 Team Totals Records")
     st.caption("Cada pick oficial entra inmediatamente como PENDING. Cuando MLB marca el juego FINAL, se añade el total real y se califica WIN/LOSS/PUSH automáticamente.")
     rows=totals_record_rows()
     if not rows:
-        st.info("Todavía no hay picks oficiales de Totals guardados.")
+        st.info("Todavía no hay Team Totals oficiales guardados.")
         return
     df=pd.DataFrame(rows)
     settled=df[df["Result"].isin(["WIN","LOSS","PUSH"])]
@@ -3132,8 +3099,8 @@ def render_totals_records():
 def render_totals_lab():
     st.markdown("""
     <div class="hero">
-      <div class="section-label">MODELO PROFESIONAL MLB · TOTALS</div>
-      <div style="font-size:2.05rem;font-weight:880;margin-top:3px">MLB Over / Under Lab</div>
+      <div class="section-label">MODELO PROFESIONAL MLB · TEAM TOTALS</div>
+      <div style="font-size:2.05rem;font-weight:880;margin-top:3px">MLB Team Totals Lab</div>
       <div style="opacity:.70;margin-top:6px">V1.0 · Filtro inicial + M1–M10 · Cutoff-safe · Sin mezclar con el motor de strikeouts</div>
     </div>
     """,unsafe_allow_html=True)
@@ -3143,7 +3110,7 @@ def render_totals_lab():
         td=st.date_input("Fecha",value=date.today(),min_value=date(2015,1,1),key="totals_date")
     with trec_col:
         st.write("");st.write("")
-        if st.button("📊 RÉCORDS O/U",use_container_width=True,key="totals_records_btn"):
+        if st.button("📊 RÉCORDS TEAM TOTALS",use_container_width=True,key="totals_records_btn"):
             st.session_state["totals_show_records"]=True
     if st.session_state.get("totals_show_records"):
         if st.button("← TOTALS",key="back_totals_records"):
@@ -3158,7 +3125,7 @@ def render_totals_lab():
 
     if "totals_game_pk" not in st.session_state:st.session_state["totals_game_pk"]=None
     if st.session_state["totals_game_pk"] is None:
-        st.markdown(f"### Daily Totals Board · {td.strftime('%A · %B %d').upper()}")
+        st.markdown(f"### Team Totals · Compact View · {td.strftime('%A · %B %d').upper()}")
         cols=st.columns(3)
         for i,g in enumerate(games):
             if len(g)<2:continue
@@ -3166,20 +3133,34 @@ def render_totals_lab():
             state=live_game_state(away.get("game_pk"))
             score=(f"{state.get('away_runs',0)}–{state.get('home_runs',0)}" if (state.get('is_live') or state.get('is_final')) else "—")
             with cols[i%3]:
-                st.markdown(f"**{away['team']} @ {home['team']}**  \n{away['pitcher_name']} vs {home['pitcher_name']}  \n{away.get('game_time','TBD')} · {away.get('venue','')}  \nScore: **{score}**")
-                if st.button("ANALIZAR TOTAL",key=f"tot_{away['game_pk']}",use_container_width=True):
-                    st.session_state["totals_game_pk"]=int(away["game_pk"]);st.rerun()
+                lineup_ok,_,_=totals_lineup_status(int(away["game_pk"]),g,td)
+                badge="✅ CONFIRMED" if lineup_ok else "⭐ PROJECTED"
+                st.markdown(f"**{away['team']} @ {home['team']}**  \n{away.get('game_time','TBD')} · {away.get('venue','')}  \nScore: **{score}**  \n{badge}")
+                c1,c2=st.columns(2)
+                with c1:
+                    if st.button(away['team'],key=f"tt_a_{away['game_pk']}",use_container_width=True):
+                        st.session_state["totals_game_pk"]=int(away["game_pk"]);st.session_state["team_totals_side"]="away";st.rerun()
+                with c2:
+                    if st.button(home['team'],key=f"tt_h_{away['game_pk']}",use_container_width=True):
+                        st.session_state["totals_game_pk"]=int(away["game_pk"]);st.session_state["team_totals_side"]="home";st.rerun()
         return
 
     gp=int(st.session_state["totals_game_pk"])
     g=next((x for x in games if x and int(x[0].get("game_pk"))==gp),None)
     if not g:
         st.session_state["totals_game_pk"]=None;st.rerun()
-    if st.button("← TOTALS SLATE"):
-        st.session_state["totals_game_pk"]=None;st.rerun()
+    nav1,nav2=st.columns([1,1])
+    with nav1:
+        if st.button("← COMPACT VIEW"):
+            st.session_state["totals_game_pk"]=None;st.rerun()
+    with nav2:
+        if st.button("📊 RÉCORDS",use_container_width=True,key=f"tt_records_detail_{gp}"):
+            st.session_state["totals_show_records"]=True;st.session_state["totals_game_pk"]=None;st.rerun()
     away=next((x for x in g if x.get("team_side")=="away"),g[0]); home=next((x for x in g if x.get("team_side")=="home"),g[-1])
-    st.markdown(f"## {away['team']} @ {home['team']}")
-    st.caption(f"{away['pitcher_name']} vs {home['pitcher_name']} · {away.get('venue')} · {away.get('game_time')}")
+    selected_side=st.session_state.get("team_totals_side","away"); selected_team=away if selected_side=="away" else home
+    st.markdown(f"## Team Totals Detailed · {selected_team['team']}")
+    st.caption(f"{away['team']} @ {home['team']} · {away['pitcher_name']} vs {home['pitcher_name']} · {away.get('venue')} · {away.get('game_time')}")
+    st.info("Compact/Detailed y estados PROJECTED/CONFIRMED ya están activos. El motor Team Totals específico queda separado del antiguo Full Game total; no se fabrica una proyección de equipo con una fórmula no validada.")
 
     # Market input is isolated in M8. Until an automatic verified totals source is
     # connected, missing values keep M8 pending instead of inventing prices.
@@ -3292,8 +3273,8 @@ def render_totals_lab():
 # ============================================================
 
 # Dual-lab router. Totals is a separate engine; switching does not alter strikeout state.
-lab_mode=st.radio("Laboratorio",["⚾ Strikeouts","📈 Totals O/U"],horizontal=True,key="global_lab_mode",label_visibility="collapsed")
-if lab_mode=="📈 Totals O/U":
+lab_mode=st.radio("Mercado",["⚾ Strikeouts","📊 Team Totals"],horizontal=True,key="global_lab_mode",label_visibility="collapsed")
+if lab_mode=="📊 Team Totals":
     render_totals_lab()
     st.stop()
 
@@ -3304,7 +3285,7 @@ st.markdown(
     <div class="hero">
       <div class="section-label">MODELO PROFESIONAL MLB · STARTING PITCHER STRIKEOUTS</div>
       <div style="font-size:2.05rem;font-weight:880;margin-top:3px">Starting Pitcher Strikeout Lab</div>
-      <div style="opacity:.70;margin-top:6px">V3.3.1 DUAL LAB · OFFICIAL PICK RECORDS · STRIKEOUT ENGINE · Confirmed-Lineup 100% Gate · Official Snapshot Cleanup · Records Fix · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
+      <div style="opacity:.70;margin-top:6px">V3.4.0 MARKET HUB · COMPACT + DETAILED · IMMUTABLE RECORDS · STRIKEOUT ENGINE · Confirmed-Lineup 100% Gate · Official Snapshot Cleanup · Records Fix · Clean Uniform Score Cards · ET Game Times · Clickable Pitcher Names · In-Card Score/K Tracker · Lineup Team Guard · Sample-Size Protection · Automatic Leash Intelligence · AI Analyst</div>
     </div>
     """, unsafe_allow_html=True
 )
@@ -3317,15 +3298,7 @@ if not st.session_state.get("official_snapshot_cleanup_v3215"):
     purge_provisional_snapshots()
     st.session_state["official_snapshot_cleanup_v3215"]=True
 
-date_col,records_col,_=st.columns([1.15,.85,1.15])
-with date_col:
-    game_date=st.date_input("Fecha",value=date.today(),min_value=date(2015,1,1),key="slate_date")
-with records_col:
-    st.write("")
-    st.write("")
-    if st.button("📊 RÉCORDS",use_container_width=True):
-        st.session_state["view_mode"]="records"
-        st.query_params.clear()
+game_date=st.date_input("Fecha",value=date.today(),min_value=date(2015,1,1),key="slate_date")
 
 try:
     options=pitchers_for_date(game_date.isoformat())
@@ -3358,6 +3331,7 @@ if st.session_state["view_mode"]=="records":
     st.stop()
 
 if st.session_state["view_mode"]=="slate":
+    settle_validation_snapshots()
     # Automatically generate/freeze pregame MODEL K for every starter. Missing
     # projections are never backfilled once a game has started.
     auto_done,auto_failed=ensure_automatic_slate_projections(options,game_date)
@@ -3368,7 +3342,7 @@ if st.session_state["view_mode"]=="slate":
         f"""
         <div class="slate-header">
           <div>
-            <div class="section-label">DAILY PITCHER BOARD</div>
+            <div class="section-label">STRIKEOUTS · COMPACT VIEW</div>
             <div style="font-size:1.38rem;font-weight:850">{game_date.strftime('%A · %B %d').upper()}</div>
           </div>
           <div class="slate-count">{len(games)} GAMES · {len(options)} STARTERS</div>
@@ -3433,7 +3407,8 @@ if st.session_state["view_mode"]=="slate":
             """
             snap=official_projection_snapshot(opt.get("game_pk"),opt.get("pitcher_id"))
             proj_k=safe_num(snap.get("projected_k")) if snap else None
-            actual=live_state.get("pitcher_ks",{}).get(int(opt.get("pitcher_id"))) if live_state else None
+            actual=safe_num(snap.get("actual_k")) if snap and snap.get("actual_k") is not None else None
+            if actual is None:actual=live_state.get("pitcher_ks",{}).get(int(opt.get("pitcher_id"))) if live_state else None
 
             pieces=[]
             if proj_k is not None:
@@ -3497,12 +3472,13 @@ if st.session_state["view_mode"]=="slate":
 
 selected_id=st.session_state["selected_pitcher_id"]
 p=by_id[selected_id]
-back_col,title_col=st.columns([.65,3.35])
+back_col,records_detail_col,title_col=st.columns([.65,.85,2.5])
 with back_col:
-    if st.button("← SLATE",use_container_width=True):
-        st.session_state["view_mode"]="slate"
-        st.query_params.clear()
-        st.rerun()
+    if st.button("← COMPACT",use_container_width=True):
+        st.session_state["view_mode"]="slate";st.query_params.clear();st.rerun()
+with records_detail_col:
+    if st.button("📊 RÉCORDS",use_container_width=True,key="strike_records_detail"):
+        st.session_state["view_mode"]="records";st.query_params.clear();st.rerun()
 
 cutoff=game_cutoff(game_date)
 cutoff_str=cutoff.isoformat()
